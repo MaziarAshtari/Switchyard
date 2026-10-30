@@ -65,47 +65,68 @@ what was decided and why.
     and falls back to a local estimate.
 24. **`GET /v1/models` answers in Anthropic format** when the request carries an
     `anthropic-version` header, otherwise in OpenAI format.
+25. **Anthropic targets get `temperature` capped at 1** (OpenAI allows up to 2) and `top_p`
+    dropped when a temperature is set: current Claude models reject both together.
+26. **`tool_choice` is omitted when no tools remain** after translation (e.g. a request that
+    only had Anthropic server tools), because providers reject it on its own.
+27. **Gemini requests merge consecutive messages with the same role**; Gemini expects
+    alternating roles.
+28. **No CORS headers.** Switchyard is meant for server-side clients and tools; browser apps
+    should call it through their own backend.
 
 ## Non-chat endpoints
 
-25. **Non-chat models only target openai-type providers.** For Gemini embeddings/images,
+29. **Non-chat models only target openai-type providers.** For Gemini embeddings/images,
     add Gemini's OpenAI-compatible endpoint
     (`https://generativelanguage.googleapis.com/v1beta/openai`) as an openai provider.
-26. **Videos**: OpenAI retired its own Videos API on 2026-09-24, but compatible providers
+30. **Videos**: OpenAI retired its own Videos API on 2026-09-24, but compatible providers
     keep the OpenAI-style shape, so `/v1/videos` is a generic passthrough.
     `GET /v1/videos/{id}/content` is also proxied (otherwise the result cannot be
     downloaded). Only the creating `POST` is logged; status polls and downloads are not.
 
 ## Security and admin
 
-27. **`ADMIN_PASSWORD` only initialises the password.** Afterwards it is changed in
+31. **`ADMIN_PASSWORD` only initialises the password.** Afterwards it is changed in
     Settings. `switchyard reset-password` re-applies `ADMIN_PASSWORD` if it is forgotten.
     Hashing: PBKDF2-SHA256 (standard library).
-28. **Login rate limit**: 5 failed attempts per IP per 15 minutes, keyed on the TCP peer
+32. **Login rate limit**: 5 failed attempts per IP per 15 minutes, keyed on the TCP peer
     address. Behind a reverse proxy this becomes a global limit, which is fine for a
     single user.
-29. **Sessions are stored in SQLite** (survive restarts), expire after 30 days, and
+33. **Sessions are stored in SQLite** (survive restarts), expire after 30 days, and
     changing the password signs out all other sessions.
-30. **Encryption key**: AES-256 key derived from `ENCRYPTION_KEY` with HKDF-SHA256. A check
+34. **Encryption key**: AES-256 key derived from `ENCRYPTION_KEY` with HKDF-SHA256. A check
     value stored at first start makes Switchyard refuse to start with a different key
     instead of failing later on every request.
-31. **Bulk key import skips duplicates** using an HMAC fingerprint of the secret (secrets
+35. **Bulk key import skips duplicates** using an HMAC fingerprint of the secret (secrets
     are encrypted with random nonces, so they cannot be compared directly).
-32. **Gateway keys** look like `sy-` + 48 hex characters and are stored as SHA-256 hashes.
-33. **Deleting a proxy** switches keys that used it to "inherit" and clears it as a provider
+36. **Gateway keys** look like `sy-` + 48 hex characters and are stored as SHA-256 hashes.
+37. **Deleting a proxy** switches keys that used it to "inherit" and clears it as a provider
     default. The confirmation dialog shows how many keys and providers are affected.
 
 ## Logs and GUI
 
-34. **Requests rejected by gateway auth are not logged** (avoids log spam); everything after
+38. **Requests rejected by gateway auth are not logged** (avoids log spam); everything after
     authentication is.
-35. **Body logging** stores text bodies only, truncated to the configured size; binary and
+39. **Body logging** stores text bodies only, truncated to the configured size; binary and
     multipart bodies are replaced by a short placeholder.
-36. **"Today" on the dashboard** starts at the browser's local midnight.
-37. **Proxy test URL** is a global setting (Settings page). Test results are shown but not
+40. **"Today" on the dashboard** starts at the browser's local midnight.
+41. **Proxy test URL** is a global setting (Settings page). Test results are shown but not
     stored.
-38. **Model "Test"** sends a small real request for chat, embedding, image, TTS and ASR
+42. **Model "Test"** sends a small real request for chat, embedding, image, TTS and ASR
     (ASR uses a generated second of silence). Video models cannot be tested: generation is
     slow and expensive.
-39. **No chart or drag-and-drop libraries**: charts are simple CSS bars; target reordering
+43. **No chart or drag-and-drop libraries**: charts are simple CSS bars; target reordering
     uses native HTML5 drag-and-drop plus up/down buttons.
+44. **Post-processors observe, they do not rewrite.** They run after the response was sent
+    (a streamed response cannot be changed afterwards) and before the log entry is written.
+45. **Requests the client abandons** are logged with status 499.
+46. **"Test key"** lists the provider's models with that key (through the key's proxy),
+    which checks authentication and connectivity without spending tokens.
+
+## Dependencies
+
+47. **SOCKS5 without `golang.org/x/net/proxy`.** `net/http` supports `socks5://` proxy URLs
+    (including username/password) natively, so the spec's suggested dependency is not
+    needed. A test performs a real SOCKS5 handshake with authentication.
+48. **CSRF protection** uses `http.CrossOriginProtection` from the standard library on top
+    of the `SameSite=Strict` session cookie.

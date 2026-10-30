@@ -19,7 +19,7 @@ cmd/switchyard          main: config -> db -> services -> HTTP server; subcomman
 internal/config         environment variables
 internal/secret         AES-GCM encryption of upstream keys / proxy passwords,
                         HMAC fingerprints (dedupe), masking
-internal/db             open SQLite + run embedded SQL migrations (db/migrations/*.sql)
+internal/db             open SQLite + run embedded SQL migrations (internal/db/migrations)
 internal/store          all SQL: providers, keys, proxies, models, gateway keys,
                         settings, sessions, request logs, video jobs
 internal/routing        PURE routing logic: target ordering, key ordering,
