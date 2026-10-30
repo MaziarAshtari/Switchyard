@@ -1,0 +1,9 @@
+.git
+.hoplite
+.env
+data
+bin
+**/node_modules
+web/dist
+*.db
+*.db-*
