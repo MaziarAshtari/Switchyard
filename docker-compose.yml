@@ -1,0 +1,18 @@
+services:
+  switchyard:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: switchyard:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - switchyard-data:/data
+
+volumes:
+  switchyard-data:
