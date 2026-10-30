@@ -7,6 +7,8 @@
 package adapter
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -248,4 +250,11 @@ func Truncate(s string, n int) string {
 		n--
 	}
 	return s[:n] + "..."
+}
+
+// NewID returns prefix followed by 24 random hex characters.
+func NewID(prefix string) string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return prefix + hex.EncodeToString(b)
 }
