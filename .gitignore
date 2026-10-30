@@ -1,0 +1,24 @@
+# Go
+/bin/
+/switchyard
+*.test
+*.out
+coverage.*
+
+# Runtime data
+/data/
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Frontend
+node_modules/
+web/dist/*
+!web/dist/.gitkeep
+*.tsbuildinfo
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
