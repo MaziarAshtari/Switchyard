@@ -178,6 +178,12 @@ func (s *Store) GetProvider(ctx context.Context, id int64) (Provider, error) {
 	return p, nil
 }
 
+// LookupProvider returns one provider without key counts (cheap; used per request).
+func (s *Store) LookupProvider(ctx context.Context, id int64) (Provider, error) {
+	p, err := scanProvider(s.db.QueryRowContext(ctx, providerSelect+` WHERE p.id = ?`, id))
+	return p, notFound(err)
+}
+
 // CreateProvider validates and inserts a provider.
 func (s *Store) CreateProvider(ctx context.Context, in ProviderInput) (Provider, error) {
 	if err := s.normalizeProvider(ctx, &in); err != nil {
