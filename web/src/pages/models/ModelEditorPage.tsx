@@ -8,13 +8,15 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { EmptyState, ErrorState, Field, FormError, Loading, PageHeader } from '@/components/common'
 import { ConfirmDialog, type ConfirmOptions } from '@/components/ConfirmDialog'
 import { Tip } from '@/components/Tip'
 import { api, ApiError } from '@/lib/api'
 import { intInRange, toErrors, useFormState, type Errors } from '@/lib/form'
 import { modelTypes, retryOnOptions, strategies } from '@/lib/labels'
-import { useAction, useModelTest, useProviders } from '@/lib/queries'
+import { useAction, useModels, useModelTest, useProviders } from '@/lib/queries'
 import type { Model, ModelInput, ModelType, Provider, RetryOn, Strategy } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { TestOutcome } from './ModelTest'
@@ -22,6 +24,11 @@ import { TargetsEditor, type TargetRow } from './TargetsEditor'
 
 const back = { to: '/models', label: 'Models' }
 const allRetryOn: RetryOn[] = ['429', '5xx', 'timeout', 'connection']
+const maxAttempts = 200
+const maxPromptLength = 4000
+// Same text as store.DefaultVisionBridgePrompt.
+const defaultVisionPrompt =
+  "Describe this image in detail, including all visible text, objects, layout, and relevant context so another AI without vision can answer the user's request accurately."
 let nextRowKey = 1
 
 export default function ModelEditorPage() {
@@ -77,6 +84,9 @@ interface FormValues {
   max_keys_per_target: string
   retry_on: RetryOn[]
   attempt_timeout_seconds: string
+  vision_bridge_enabled: boolean
+  vision_bridge_model_id: number | null
+  vision_bridge_prompt: string
   targets: TargetRow[]
 }
 
@@ -89,6 +99,9 @@ function initialValues(m?: Model): FormValues {
     max_keys_per_target: String(m?.max_keys_per_target ?? 2),
     retry_on: m?.retry_on ?? allRetryOn,
     attempt_timeout_seconds: String(m?.attempt_timeout_seconds ?? 120),
+    vision_bridge_enabled: m?.vision_bridge_enabled ?? false,
+    vision_bridge_model_id: m?.vision_bridge_model_id ?? null,
+    vision_bridge_prompt: m?.vision_bridge_prompt ?? defaultVisionPrompt,
     targets: (m?.targets ?? []).map((t) => ({
       key: nextRowKey++,
       provider_id: t.provider_id,
@@ -104,13 +117,18 @@ function validate(v: FormValues, providers: Provider[]): { input?: ModelInput; e
   const name = v.name.trim()
   if (!name) errors.name = 'Name is required'
   else if (/\s/.test(name)) errors.name = 'Name must not contain spaces'
-  const attempts = intInRange(v.max_total_attempts, 1, 20)
-  if (attempts === null) errors.max_total_attempts = 'Enter a number from 1 to 20'
-  const keysPerTarget = intInRange(v.max_keys_per_target, 1, 20)
-  if (keysPerTarget === null) errors.max_keys_per_target = 'Enter a number from 1 to 20'
+  const attempts = intInRange(v.max_total_attempts, 1, maxAttempts)
+  if (attempts === null) errors.max_total_attempts = `Enter a number from 1 to ${maxAttempts}`
+  const keysPerTarget = intInRange(v.max_keys_per_target, 1, maxAttempts)
+  if (keysPerTarget === null) errors.max_keys_per_target = `Enter a number from 1 to ${maxAttempts}`
   const timeout = intInRange(v.attempt_timeout_seconds, 1, 3600)
   if (timeout === null) errors.attempt_timeout_seconds = 'Enter a number of seconds from 1 to 3600'
   if (v.targets.length === 0) errors.targets = 'Add at least one target'
+  const chat = v.type === 'chat'
+  const bridge = chat && v.vision_bridge_enabled
+  if (bridge && v.vision_bridge_model_id === null) errors.vision_bridge_model_id = 'Choose the model that describes images'
+  const prompt = v.vision_bridge_prompt.trim()
+  if (chat && prompt.length > maxPromptLength) errors.vision_bridge_prompt = `Use at most ${maxPromptLength} characters`
 
   const targets = v.targets.map((t, i) => {
     const provider = providers.find((p) => p.id === t.provider_id)
@@ -141,6 +159,9 @@ function validate(v: FormValues, providers: Provider[]): { input?: ModelInput; e
       max_keys_per_target: keysPerTarget,
       retry_on: v.retry_on,
       attempt_timeout_seconds: timeout,
+      vision_bridge_enabled: bridge,
+      vision_bridge_model_id: chat ? v.vision_bridge_model_id : null,
+      vision_bridge_prompt: chat ? prompt : '',
       targets,
     },
   }
@@ -149,6 +170,7 @@ function validate(v: FormValues, providers: Provider[]): { input?: ModelInput; e
 function ModelForm({ model }: { model?: Model }) {
   const navigate = useNavigate()
   const providers = useProviders()
+  const models = useModels()
   const [values, set, setValues] = useFormState(() => initialValues(model))
   const [errors, setErrors] = useState<Errors>({})
   const [confirm, setConfirm] = useState<ConfirmOptions | null>(null)
@@ -159,6 +181,7 @@ function ModelForm({ model }: { model?: Model }) {
   )
   const providerList = providers.data ?? []
   const typeInfo = modelTypes.find((t) => t.value === values.type)
+  const visionChoices = (models.data ?? []).filter((m) => m.type === 'chat' && m.id !== model?.id)
 
   function submit(e: FormEvent) {
     e.preventDefault()
@@ -295,7 +318,7 @@ function ModelForm({ model }: { model?: Model }) {
                 label="Max total attempts"
                 htmlFor="model-attempts"
                 error={errors.max_total_attempts}
-                help="1–20, across all targets and keys."
+                help={`1–${maxAttempts}, across all targets and keys.`}
               >
                 <Input
                   id="model-attempts"
@@ -309,7 +332,7 @@ function ModelForm({ model }: { model?: Model }) {
                 label="Max keys per target"
                 htmlFor="model-keys"
                 error={errors.max_keys_per_target}
-                help="1–20 keys tried before moving to the next target."
+                help={`1–${maxAttempts} keys tried before moving to the next target.`}
               >
                 <Input
                   id="model-keys"
@@ -354,6 +377,68 @@ function ModelForm({ model }: { model?: Model }) {
             </p>
           </div>
         </Section>
+
+        {values.type === 'chat' && (
+          <Section title="Vision bridge" description="Lets this model accept images even if its targets cannot see them.">
+            <div className="grid gap-4">
+              <label className="flex items-center justify-between gap-4 rounded-md border p-3">
+                <span className="grid gap-0.5">
+                  <span className="text-sm font-medium">Describe images first</span>
+                  <span className="text-xs text-muted-foreground">
+                    Each image is sent to the vision model and replaced by its description before this model is called.
+                  </span>
+                </span>
+                <Switch
+                  checked={values.vision_bridge_enabled}
+                  onCheckedChange={(c) => set('vision_bridge_enabled', c)}
+                  aria-label="Vision bridge"
+                />
+              </label>
+              <Field
+                label="Vision model"
+                htmlFor="model-vision"
+                error={errors.vision_bridge_model_id}
+                help={visionChoices.length ? 'Another chat model that accepts images.' : 'Create another chat model first.'}
+              >
+                <Select
+                  value={values.vision_bridge_model_id === null ? '' : String(values.vision_bridge_model_id)}
+                  onValueChange={(v) => set('vision_bridge_model_id', Number(v))}
+                  disabled={!values.vision_bridge_enabled}
+                >
+                  <SelectTrigger
+                    id="model-vision"
+                    className="w-full sm:w-80"
+                    aria-invalid={!!errors.vision_bridge_model_id}
+                  >
+                    <SelectValue placeholder="Choose a chat model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {visionChoices.map((m) => (
+                      <SelectItem key={m.id} value={String(m.id)}>
+                        <span className="font-mono">{m.name}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field
+                label="Prompt"
+                htmlFor="model-vision-prompt"
+                error={errors.vision_bridge_prompt}
+                help="Sent with each image, together with the text of the user's message."
+              >
+                <Textarea
+                  id="model-vision-prompt"
+                  rows={3}
+                  value={values.vision_bridge_prompt}
+                  onChange={(e) => set('vision_bridge_prompt', e.target.value)}
+                  disabled={!values.vision_bridge_enabled}
+                  aria-invalid={!!errors.vision_bridge_prompt}
+                />
+              </Field>
+            </div>
+          </Section>
+        )}
       </div>
 
       <div className="sticky bottom-0 z-10 -mx-4 mt-6 -mb-4 flex flex-wrap items-center justify-end gap-2 border-t bg-background/95 px-4 py-3 backdrop-blur sm:-mx-6 sm:-mb-6 sm:px-6 lg:-mx-8 lg:-mb-8 lg:px-8">

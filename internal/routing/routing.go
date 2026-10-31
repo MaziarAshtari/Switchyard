@@ -43,6 +43,9 @@ type Target struct {
 	ID          int64
 	ProviderID  int64
 	KeyStrategy string // the provider's key strategy
+	// KeyRecovery is how long the provider's keys stay disabled after an auth
+	// error before they become active again; 0 means until reset.
+	KeyRecovery time.Duration
 	Weight      int
 	Enabled     bool // target and its provider are enabled
 }
@@ -53,6 +56,7 @@ type Key struct {
 	Enabled       bool
 	Status        string
 	CooldownUntil time.Time
+	DisabledUntil time.Time // automatic re-activation of a disabled key; zero = never
 	LastUsedAt    time.Time
 	ProxyOK       bool // false when the key's (inherited) proxy is disabled or missing
 }
@@ -64,7 +68,7 @@ func (k Key) Available(now time.Time) bool {
 	}
 	switch k.Status {
 	case StatusDisabled:
-		return false
+		return !k.DisabledUntil.IsZero() && !now.Before(k.DisabledUntil)
 	case StatusCoolingDown:
 		return !now.Before(k.CooldownUntil)
 	}
@@ -257,7 +261,7 @@ const (
 	KeySuccess                   // success counter, status back to active
 	KeyFailure                   // failure counter
 	KeyCooldown                  // failure counter, cooling down until CooldownUntil
-	KeyDisable                   // failure counter, disabled until reset
+	KeyDisable                   // failure counter, disabled until reset or DisabledUntil
 )
 
 // Decision is the result of classifying an outcome.
@@ -265,10 +269,12 @@ type Decision struct {
 	Retry         bool
 	Action        KeyAction
 	CooldownUntil time.Time
+	DisabledUntil time.Time // KeyDisable only; zero = disabled until reset
 }
 
-// Decide classifies an attempt outcome.
-func Decide(o Outcome, retry RetryOn, now time.Time, defaultCooldown time.Duration) Decision {
+// Decide classifies an attempt outcome. keyRecovery is how long a key
+// disabled by an auth error stays disabled (0 = until reset).
+func Decide(o Outcome, retry RetryOn, now time.Time, defaultCooldown, keyRecovery time.Duration) Decision {
 	switch {
 	case o.Committed:
 		return Decision{Action: KeySuccess}
@@ -285,7 +291,11 @@ func Decide(o Outcome, retry RetryOn, now time.Time, defaultCooldown time.Durati
 		}
 		return Decision{Retry: retry.RateLimit, Action: KeyCooldown, CooldownUntil: now.Add(d)}
 	case o.Status == http.StatusUnauthorized || o.Status == http.StatusPaymentRequired || o.Status == http.StatusForbidden:
-		return Decision{Retry: true, Action: KeyDisable}
+		d := Decision{Retry: true, Action: KeyDisable}
+		if keyRecovery > 0 {
+			d.DisabledUntil = now.Add(keyRecovery)
+		}
+		return d
 	case o.Status >= 500:
 		return Decision{Retry: retry.Server, Action: KeyFailure}
 	default:
@@ -392,7 +402,7 @@ func (p *Plan) Next() (Attempt, bool) {
 // Report records the outcome of attempt a and returns the decision. After a
 // decision without Retry, Next returns false.
 func (p *Plan) Report(a Attempt, o Outcome) Decision {
-	d := Decide(o, p.policy.RetryOn, p.router.now(), p.policy.DefaultCooldown)
+	d := Decide(o, p.policy.RetryOn, p.router.now(), p.policy.DefaultCooldown, a.Target.KeyRecovery)
 	if d.Action == KeyCooldown || d.Action == KeyDisable {
 		p.blocked[a.Key.ID] = true
 	}

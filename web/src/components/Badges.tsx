@@ -74,11 +74,14 @@ export function KeyStatusBadges({ apiKey }: { apiKey: ApiKey }) {
     <div className="flex flex-wrap items-center gap-1">
       {apiKey.status === 'active' && <ToneBadge tone="green">Active</ToneBadge>}
       {apiKey.status === 'cooling_down' && <CoolingDownBadge until={apiKey.cooldown_until} />}
-      {apiKey.status === 'disabled' && (
-        <Tip content={apiKey.last_error || 'Disabled after an authentication error'}>
-          <ToneBadge tone="red">Disabled</ToneBadge>
-        </Tip>
-      )}
+      {apiKey.status === 'disabled' &&
+        (apiKey.disabled_until ? (
+          <RecoveringBadge until={apiKey.disabled_until} reason={apiKey.last_error} />
+        ) : (
+          <Tip content={apiKey.last_error || 'Disabled after an authentication error'}>
+            <ToneBadge tone="red">Disabled</ToneBadge>
+          </Tip>
+        ))}
       {!apiKey.enabled && (
         <Tip content="Switched off: this key is never used">
           <ToneBadge tone="grey">Off</ToneBadge>
@@ -94,6 +97,24 @@ function CoolingDownBadge({ until }: { until: string | null }) {
   return (
     <Tip content={until ? `Cooling down until ${fullTime(until)}` : 'Cooling down after a 429 response'}>
       <ToneBadge tone="amber">Cooling down{remaining > 0 ? ` · ${duration(remaining)}` : ''}</ToneBadge>
+    </Tip>
+  )
+}
+
+function RecoveringBadge({ until, reason }: { until: string; reason: string }) {
+  const now = useNow(1000)
+  const remaining = (new Date(until).getTime() - now) / 1000
+  return (
+    <Tip
+      content={
+        <>
+          {reason || 'Disabled after an authentication error'}
+          <br />
+          Re-activated automatically at {fullTime(until)}
+        </>
+      }
+    >
+      <ToneBadge tone="red">Disabled{remaining > 0 ? ` · ${duration(remaining)}` : ''}</ToneBadge>
     </Tip>
   )
 }

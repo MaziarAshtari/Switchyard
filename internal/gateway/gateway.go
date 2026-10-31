@@ -32,13 +32,25 @@ type Exchange struct {
 	Header      http.Header    // client request headers
 	ContentType string
 	Body        []byte // client request body; pre-processors may rewrite it
+	// SubRequests are requests a pre-processor sent through the gateway (such
+	// as vision bridge calls); they are added to the request's attempt details.
+	SubRequests []store.Attempt
 }
 
 // PreProcessor may inspect or rewrite a request after the model is resolved
-// and before it is routed. Returning an error rejects the request with 400.
+// and before it is routed. Returning an error rejects the request with the
+// status of a *ProcessError, or 400 for any other error.
 type PreProcessor interface {
 	PreProcess(ctx context.Context, x *Exchange) error
 }
+
+// ProcessError rejects a request from a PreProcessor with a specific status.
+type ProcessError struct {
+	Status  int
+	Message string
+}
+
+func (e *ProcessError) Error() string { return e.Message }
 
 // PostProcessor observes a finished request (the response has been sent)
 // before it is logged.
@@ -58,7 +70,7 @@ type Gateway struct {
 	inbound  map[adapter.Format]adapter.Inbound
 	upstream map[string]adapter.Upstream // by provider type
 
-	// Pre and Post are the processor hooks; empty for now.
+	// Pre and Post are the processor hooks. Pre holds the vision bridge.
 	Pre  []PreProcessor
 	Post []PostProcessor
 }
@@ -66,13 +78,15 @@ type Gateway struct {
 // New returns a Gateway.
 func New(st *store.Store, router *routing.Router, clients *proxy.Clients, logs *LogWriter, log *slog.Logger, version string) *Gateway {
 	oa, an := openai.New(), anthropic.New()
-	return &Gateway{
+	g := &Gateway{
 		store: st, router: router, clients: clients, logs: logs, log: log, version: version,
 		inbound: map[adapter.Format]adapter.Inbound{adapter.OpenAI: oa, adapter.Anthropic: an},
 		upstream: map[string]adapter.Upstream{
 			string(adapter.OpenAI): oa, string(adapter.Anthropic): an, string(adapter.Gemini): gemini.New(),
 		},
 	}
+	g.Pre = []PreProcessor{visionBridge{g}}
+	return g
 }
 
 // endpoint describes a model-based client endpoint.

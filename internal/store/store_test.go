@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -322,5 +323,209 @@ func TestGatewayKeys(t *testing.T) {
 	s.UpdateGatewayKey(ctx, k.ID, GatewayKeyInput{Name: "laptop", Enabled: false})
 	if _, err := s.AuthenticateGatewayKey(ctx, k.Secret); !errors.Is(err, ErrNotFound) {
 		t.Fatal("disabled key must not authenticate")
+	}
+}
+
+func chatModel(name string, targetProvider int64) ModelInput {
+	return ModelInput{Name: name, Type: "chat", MaxTotalAttempts: 3, MaxKeysPerTarget: 2, AttemptTimeoutSeconds: 60,
+		Targets: []TargetInput{{ProviderID: targetProvider, UpstreamModel: "m", Enabled: true}}}
+}
+
+func TestModelRetryLimitsGoUpTo200(t *testing.T) {
+	s, _ := newStore(t)
+	p := mustProvider(t, s, "P", "openai")
+	in := chatModel("big", p.ID)
+	in.MaxTotalAttempts, in.MaxKeysPerTarget = 200, 200
+	m, err := s.CreateModel(ctx, in)
+	if err != nil || m.MaxTotalAttempts != 200 || m.MaxKeysPerTarget != 200 {
+		t.Fatalf("200 must be accepted: %+v %v", m, err)
+	}
+	in.MaxTotalAttempts, in.MaxKeysPerTarget = 201, 201
+	_, err = s.UpdateModel(ctx, m.ID, in)
+	fieldErr(t, err, "max_total_attempts")
+	fieldErr(t, err, "max_keys_per_target")
+}
+
+func TestKeyRecoverySettingAndProviderOverride(t *testing.T) {
+	s, _ := newStore(t)
+	set, _ := s.Settings(ctx)
+	if set.DisabledKeyRecoveryMinutes != 0 {
+		t.Fatalf("default must be 0 (never): %+v", set)
+	}
+	for _, bad := range []int{-1, MaxKeyRecoveryMinutes + 1} {
+		set.DisabledKeyRecoveryMinutes = bad
+		_, err := s.SaveSettings(ctx, set)
+		fieldErr(t, err, "disabled_key_recovery_minutes")
+	}
+	set.DisabledKeyRecoveryMinutes = 30
+	if _, err := s.SaveSettings(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	s.settings = nil
+	if set, _ = s.Settings(ctx); set.DisabledKeyRecoveryMinutes != 30 {
+		t.Fatalf("not persisted: %+v", set)
+	}
+
+	p := mustProvider(t, s, "P", "openai")
+	if p.DisabledKeyRecoveryMinutes != nil || p.KeyRecovery(set) != 30*time.Minute {
+		t.Fatalf("a provider without override uses the setting: %v %v", p.DisabledKeyRecoveryMinutes, p.KeyRecovery(set))
+	}
+	in := ProviderInput{Name: "P", Type: "openai", BaseURL: p.BaseURL, Enabled: true, DisabledKeyRecoveryMinutes: ptr(-5)}
+	_, err := s.UpdateProvider(ctx, p.ID, in)
+	fieldErr(t, err, "disabled_key_recovery_minutes")
+	for _, minutes := range []int{0, 15} {
+		in.DisabledKeyRecoveryMinutes = ptr(minutes)
+		if p, err = s.UpdateProvider(ctx, p.ID, in); err != nil {
+			t.Fatal(err)
+		}
+		if *p.DisabledKeyRecoveryMinutes != minutes || p.KeyRecovery(set) != time.Duration(minutes)*time.Minute {
+			t.Fatalf("override %d: %v", minutes, p.KeyRecovery(set))
+		}
+	}
+}
+
+func TestDisabledKeyRecoversButUserSwitchStaysOff(t *testing.T) {
+	s, c := newStore(t)
+	p := mustProvider(t, s, "P", "openai")
+	k, _ := s.CreateKey(ctx, p.ID, KeyInput{Secret: "sk-recover-0000000000"})
+	off, _ := s.CreateKey(ctx, p.ID, KeyInput{Secret: "sk-switched-off-00000"})
+	s.UpdateKey(ctx, off.ID, KeyUpdate{Enabled: false})
+	disable := routing.Decision{Action: routing.KeyDisable, DisabledUntil: c.t.Add(10 * time.Minute)}
+	for _, id := range []int64{k.ID, off.ID} {
+		s.RecordKeyOutcome(ctx, id, disable, "401 invalid key")
+	}
+
+	k, _ = s.GetKey(ctx, k.ID)
+	if k.Status != routing.StatusDisabled || k.DisabledUntil == nil || !k.DisabledUntil.Equal(c.t.Add(10*time.Minute)) {
+		t.Fatalf("disabled with recovery time: %+v", k)
+	}
+	if got, _ := s.GetProvider(ctx, p.ID); got.Keys.Disabled != 1 || got.Keys.Off != 1 {
+		t.Fatalf("counts before recovery: %+v", got.Keys)
+	}
+
+	c.t = c.t.Add(10 * time.Minute)
+	k, _ = s.GetKey(ctx, k.ID)
+	if k.Status != routing.StatusActive || k.DisabledUntil != nil || !k.RoutingKey().Available(c.t) {
+		t.Fatalf("must be active after the recovery time: %+v", k)
+	}
+	off, _ = s.GetKey(ctx, off.ID)
+	if off.Enabled || off.RoutingKey().Available(c.t) {
+		t.Fatalf("a key switched off by the user must stay off: %+v", off)
+	}
+	if got, _ := s.GetProvider(ctx, p.ID); got.Keys.Active != 1 || got.Keys.Disabled != 0 || got.Keys.Off != 1 {
+		t.Fatalf("counts after recovery: %+v", got.Keys)
+	}
+
+	// A recovered key that is rate limited cools down (it must not stay "disabled").
+	s.RecordKeyOutcome(ctx, k.ID, routing.Decision{Action: routing.KeyCooldown, CooldownUntil: c.t.Add(time.Minute)}, "429")
+	if k, _ = s.GetKey(ctx, k.ID); k.Status != routing.StatusCoolingDown {
+		t.Fatalf("recovered key after 429: %+v", k)
+	}
+	// Without a recovery time the key stays disabled.
+	s.RecordKeyOutcome(ctx, k.ID, routing.Decision{Action: routing.KeyDisable}, "403")
+	c.t = c.t.Add(365 * 24 * time.Hour)
+	if k, _ = s.GetKey(ctx, k.ID); k.Status != routing.StatusDisabled || k.DisabledUntil != nil {
+		t.Fatalf("disabled until reset: %+v", k)
+	}
+}
+
+func TestResetProviderKeys(t *testing.T) {
+	s, c := newStore(t)
+	p := mustProvider(t, s, "P", "openai")
+	other := mustProvider(t, s, "Other", "openai")
+	key := func(pid int64, secret string, d *routing.Decision) APIKey {
+		k, err := s.CreateKey(ctx, pid, KeyInput{Secret: secret})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d != nil {
+			s.RecordKeyOutcome(ctx, k.ID, *d, "error")
+		}
+		return k
+	}
+	disabled := key(p.ID, "sk-disabled-000000000", &routing.Decision{Action: routing.KeyDisable})
+	key(p.ID, "sk-recovering-0000000", &routing.Decision{Action: routing.KeyDisable, DisabledUntil: c.t.Add(time.Hour)})
+	key(p.ID, "sk-cooling-0000000000", &routing.Decision{Action: routing.KeyCooldown, CooldownUntil: c.t.Add(time.Hour)})
+	key(p.ID, "sk-expired-0000000000", &routing.Decision{Action: routing.KeyCooldown, CooldownUntil: c.t.Add(-time.Minute)})
+	key(p.ID, "sk-active-00000000000", nil)
+	elsewhere := key(other.ID, "sk-elsewhere-00000000", &routing.Decision{Action: routing.KeyDisable})
+	s.UpdateKey(ctx, disabled.ID, KeyUpdate{Enabled: false})
+
+	n, err := s.ResetProviderKeys(ctx, p.ID)
+	if err != nil || n != 3 {
+		t.Fatalf("reset %d keys, err %v; want the disabled, recovering and cooling keys", n, err)
+	}
+	keys, _ := s.ListKeys(ctx, p.ID)
+	for _, k := range keys {
+		if k.Status != routing.StatusActive || k.CooldownUntil != nil || k.DisabledUntil != nil {
+			t.Fatalf("key %d not re-activated: %+v", k.ID, k)
+		}
+		if k.ID == disabled.ID && k.Enabled {
+			t.Fatal("reset must not switch on a key the user switched off")
+		}
+	}
+	if k, _ := s.GetKey(ctx, elsewhere.ID); k.Status != routing.StatusDisabled {
+		t.Fatal("keys of other providers must not change")
+	}
+	if _, err := s.ResetProviderKeys(ctx, 9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown provider: %v", err)
+	}
+}
+
+func TestVisionBridgeValidation(t *testing.T) {
+	s, _ := newStore(t)
+	p := mustProvider(t, s, "P", "openai")
+	vision, err := s.CreateModel(ctx, chatModel("vision", p.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vision.VisionBridgeEnabled || vision.VisionBridgeModelID != nil || vision.VisionBridgePrompt != DefaultVisionBridgePrompt {
+		t.Fatalf("bridge defaults: %+v", vision)
+	}
+	emb := chatModel("emb", p.ID)
+	emb.Type = "embedding"
+	embModel, err := s.CreateModel(ctx, emb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	in := chatModel("main", p.ID)
+	in.VisionBridgeEnabled = true
+	_, err = s.CreateModel(ctx, in)
+	fieldErr(t, err, "vision_bridge_model_id")
+	for _, bad := range []int64{embModel.ID, 9999} {
+		in.VisionBridgeModelID = ptr(bad)
+		_, err = s.CreateModel(ctx, in)
+		fieldErr(t, err, "vision_bridge_model_id")
+	}
+	in.VisionBridgeModelID, in.VisionBridgePrompt = &vision.ID, "  "
+	main, err := s.CreateModel(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !main.VisionBridgeEnabled || *main.VisionBridgeModelID != vision.ID || main.VisionBridgePrompt != DefaultVisionBridgePrompt {
+		t.Fatalf("bridge not saved: %+v", main)
+	}
+	in.VisionBridgeModelID = &main.ID
+	_, err = s.UpdateModel(ctx, main.ID, in)
+	fieldErr(t, err, "vision_bridge_model_id")
+
+	in.VisionBridgeModelID, in.VisionBridgePrompt = &vision.ID, strings.Repeat("x", maxVisionBridgePrompt+1)
+	_, err = s.UpdateModel(ctx, main.ID, in)
+	fieldErr(t, err, "vision_bridge_prompt")
+
+	// Non-chat models never keep a bridge.
+	emb.VisionBridgeEnabled, emb.VisionBridgeModelID, emb.VisionBridgePrompt = true, &vision.ID, strings.Repeat("x", maxVisionBridgePrompt+1)
+	if embModel, err = s.UpdateModel(ctx, embModel.ID, emb); err != nil || embModel.VisionBridgeEnabled || embModel.VisionBridgeModelID != nil ||
+		embModel.VisionBridgePrompt != DefaultVisionBridgePrompt {
+		t.Fatalf("embedding model with bridge: %+v %v", embModel, err)
+	}
+
+	// Deleting the vision model clears the reference; the bridge stays on and fails visibly.
+	if err := s.DeleteModel(ctx, vision.ID); err != nil {
+		t.Fatal(err)
+	}
+	if main, _ = s.GetModel(ctx, main.ID); main.VisionBridgeModelID != nil || !main.VisionBridgeEnabled {
+		t.Fatalf("after deleting the vision model: %+v", main)
 	}
 }

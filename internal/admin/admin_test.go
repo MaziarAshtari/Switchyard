@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -238,5 +239,44 @@ func TestGatewayKeySecretShownOnce(t *testing.T) {
 	_, _, raw := e.call(c, "GET", "/api/gateway-keys", "")
 	if strings.Contains(string(raw), created["secret"].(string)) || strings.Contains(string(raw), `"secret"`) {
 		t.Fatalf("list must not include the secret: %s", raw)
+	}
+}
+
+func TestResetProviderKeysAndRetryLimits(t *testing.T) {
+	e := newTestEnv(t)
+	c := e.login()
+	_, prov, _ := e.call(c, "POST", "/api/providers", `{"name":"OA","type":"openai","base_url":"https://api.openai.com/v1","enabled":true,"disabled_key_recovery_minutes":15}`)
+	pid := int64(prov["id"].(float64))
+	if prov["disabled_key_recovery_minutes"] != float64(15) {
+		t.Fatalf("provider override: %v", prov)
+	}
+	path := "/api/providers/" + strconv.FormatInt(pid, 10)
+	e.call(c, "POST", path+"/keys/bulk", `{"text":"sk-aaaaaaaaaaaaaaaaaaaa\nsk-bbbbbbbbbbbbbbbbbbbb"}`)
+	keys, _ := e.st.ListKeys(context.Background(), pid)
+	e.st.RecordKeyOutcome(context.Background(), keys[0].ID, routing.Decision{Action: routing.KeyDisable}, "401 invalid key")
+
+	status, res, raw := e.call(c, "POST", path+"/keys/reset", "")
+	if status != 200 || res["updated"] != float64(1) {
+		t.Fatalf("reset: %d %s", status, raw)
+	}
+	if k, _ := e.st.GetKey(context.Background(), keys[0].ID); k.Status != routing.StatusActive {
+		t.Fatalf("key not re-activated: %+v", k)
+	}
+	if status, _, _ := e.call(c, "POST", "/api/providers/999/keys/reset", ""); status != 404 {
+		t.Fatalf("unknown provider: %d", status)
+	}
+
+	model := func(attempts int) (int, map[string]any) {
+		body := fmt.Sprintf(`{"name":"m%d","type":"chat","max_total_attempts":%d,"max_keys_per_target":%d,"attempt_timeout_seconds":60,
+			"targets":[{"provider_id":%d,"upstream_model":"gpt-x","enabled":true}]}`, attempts, attempts, attempts, pid)
+		status, out, _ := e.call(c, "POST", "/api/models", body)
+		return status, out
+	}
+	if status, out := model(200); status != 201 || out["max_total_attempts"] != float64(200) {
+		t.Fatalf("200 attempts: %d %v", status, out)
+	}
+	status, out := model(201)
+	if fields, _ := out["fields"].(map[string]any); status != 400 || fields["max_total_attempts"] == nil || fields["max_keys_per_target"] == nil {
+		t.Fatalf("201 attempts: %d %v", status, out)
 	}
 }

@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MaziarAshtari/Switchyard/internal/routing"
 )
@@ -16,18 +18,32 @@ var (
 	Strategies = []string{routing.Priority, routing.RoundRobin, routing.Weighted, routing.Random}
 )
 
+// MaxAttempts bounds max_total_attempts and max_keys_per_target.
+const MaxAttempts = 200
+
+// DefaultVisionBridgePrompt is sent with each image when a model has no prompt of its own.
+const DefaultVisionBridgePrompt = "Describe this image in detail, including all visible text, objects, layout, " +
+	"and relevant context so another AI without vision can answer the user's request accurately."
+
+const maxVisionBridgePrompt = 4000 // characters
+
 // Model is a public model name and how it is routed.
 type Model struct {
-	ID                    int64     `json:"id"`
-	Name                  string    `json:"name"`
-	Type                  string    `json:"type"`
-	Strategy              string    `json:"strategy"`
-	MaxTotalAttempts      int       `json:"max_total_attempts"`
-	MaxKeysPerTarget      int       `json:"max_keys_per_target"`
-	RetryOn               []string  `json:"retry_on"`
-	AttemptTimeoutSeconds int       `json:"attempt_timeout_seconds"`
-	CreatedAt             time.Time `json:"created_at"`
-	Targets               []Target  `json:"targets"` // in priority order
+	ID                    int64    `json:"id"`
+	Name                  string   `json:"name"`
+	Type                  string   `json:"type"`
+	Strategy              string   `json:"strategy"`
+	MaxTotalAttempts      int      `json:"max_total_attempts"`
+	MaxKeysPerTarget      int      `json:"max_keys_per_target"`
+	RetryOn               []string `json:"retry_on"`
+	AttemptTimeoutSeconds int      `json:"attempt_timeout_seconds"`
+	// Vision bridge (chat models): images are described by another chat model
+	// and replaced by the description before routing.
+	VisionBridgeEnabled bool      `json:"vision_bridge_enabled"`
+	VisionBridgeModelID *int64    `json:"vision_bridge_model_id"`
+	VisionBridgePrompt  string    `json:"vision_bridge_prompt"`
+	CreatedAt           time.Time `json:"created_at"`
+	Targets             []Target  `json:"targets"` // in priority order
 }
 
 // Target is one (provider, upstream model) candidate of a model.
@@ -51,6 +67,9 @@ type ModelInput struct {
 	MaxKeysPerTarget      int           `json:"max_keys_per_target"`
 	RetryOn               []string      `json:"retry_on"`
 	AttemptTimeoutSeconds int           `json:"attempt_timeout_seconds"`
+	VisionBridgeEnabled   bool          `json:"vision_bridge_enabled"`
+	VisionBridgeModelID   *int64        `json:"vision_bridge_model_id"`
+	VisionBridgePrompt    string        `json:"vision_bridge_prompt"` // empty = default
 	Targets               []TargetInput `json:"targets"`
 }
 
@@ -62,7 +81,8 @@ type TargetInput struct {
 	Enabled       bool   `json:"enabled"`
 }
 
-func (s *Store) normalizeModel(ctx context.Context, in *ModelInput) error {
+// normalizeModel validates in; id is the model being edited (0 when creating).
+func (s *Store) normalizeModel(ctx context.Context, id int64, in *ModelInput) error {
 	errs := FieldErrors{}
 	in.Name = strings.TrimSpace(in.Name)
 	switch {
@@ -82,11 +102,11 @@ func (s *Store) normalizeModel(ctx context.Context, in *ModelInput) error {
 	if !contains(Strategies, in.Strategy) {
 		errs["strategy"] = "Choose priority, round_robin, weighted or random"
 	}
-	if in.MaxTotalAttempts < 1 || in.MaxTotalAttempts > 20 {
-		errs["max_total_attempts"] = "Must be between 1 and 20"
+	if in.MaxTotalAttempts < 1 || in.MaxTotalAttempts > MaxAttempts {
+		errs["max_total_attempts"] = fmt.Sprintf("Must be between 1 and %d", MaxAttempts)
 	}
-	if in.MaxKeysPerTarget < 1 || in.MaxKeysPerTarget > 20 {
-		errs["max_keys_per_target"] = "Must be between 1 and 20"
+	if in.MaxKeysPerTarget < 1 || in.MaxKeysPerTarget > MaxAttempts {
+		errs["max_keys_per_target"] = fmt.Sprintf("Must be between 1 and %d", MaxAttempts)
 	}
 	if in.AttemptTimeoutSeconds < 1 || in.AttemptTimeoutSeconds > 3600 {
 		errs["attempt_timeout_seconds"] = "Must be between 1 and 3600 seconds"
@@ -103,6 +123,9 @@ func (s *Store) normalizeModel(ctx context.Context, in *ModelInput) error {
 		}
 	}
 	in.RetryOn = retry
+	if err := s.normalizeVisionBridge(ctx, id, in, errs); err != nil {
+		return err
+	}
 	if len(in.Targets) == 0 {
 		errs["targets"] = "Add at least one target"
 	}
@@ -134,6 +157,39 @@ func (s *Store) normalizeModel(ctx context.Context, in *ModelInput) error {
 	return errs.orNil()
 }
 
+func (s *Store) normalizeVisionBridge(ctx context.Context, id int64, in *ModelInput, errs FieldErrors) error {
+	in.VisionBridgePrompt = strings.TrimSpace(in.VisionBridgePrompt)
+	if in.VisionBridgePrompt == "" || in.Type != "chat" {
+		in.VisionBridgePrompt = DefaultVisionBridgePrompt
+	}
+	if in.Type != "chat" {
+		in.VisionBridgeEnabled, in.VisionBridgeModelID = false, nil
+		return nil
+	}
+	if utf8.RuneCountInString(in.VisionBridgePrompt) > maxVisionBridgePrompt {
+		errs["vision_bridge_prompt"] = fmt.Sprintf("Use at most %d characters", maxVisionBridgePrompt)
+	}
+	if in.VisionBridgeModelID == nil {
+		if in.VisionBridgeEnabled {
+			errs["vision_bridge_model_id"] = "Choose the model that describes images"
+		}
+		return nil
+	}
+	var typ string
+	err := s.db.QueryRowContext(ctx, `SELECT type FROM models WHERE id = ?`, *in.VisionBridgeModelID).Scan(&typ)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		errs["vision_bridge_model_id"] = "Model not found"
+	case err != nil:
+		return err
+	case *in.VisionBridgeModelID == id:
+		errs["vision_bridge_model_id"] = "Choose another model"
+	case typ != "chat":
+		errs["vision_bridge_model_id"] = "Choose a chat model"
+	}
+	return nil
+}
+
 func (s *Store) providerTypes(ctx context.Context) (map[int64]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, type FROM providers`)
 	if err != nil {
@@ -155,7 +211,7 @@ func (s *Store) providerTypes(ctx context.Context) (map[int64]string, error) {
 }
 
 const modelSelect = `SELECT id, name, type, strategy, max_total_attempts, max_keys_per_target, retry_on,
-	attempt_timeout_seconds, created_at FROM models`
+	attempt_timeout_seconds, vision_bridge_enabled, vision_bridge_model_id, vision_bridge_prompt, created_at FROM models`
 
 func (s *Store) queryModels(ctx context.Context, where string, args ...any) ([]Model, error) {
 	rows, err := s.db.QueryContext(ctx, modelSelect+" "+where, args...)
@@ -165,18 +221,27 @@ func (s *Store) queryModels(ctx context.Context, where string, args ...any) ([]M
 	var models []Model
 	for rows.Next() {
 		var (
-			m       Model
-			retry   string
-			created int64
+			m             Model
+			retry         string
+			bridgeEnabled int
+			bridgeModel   sql.NullInt64
+			created       int64
 		)
 		if err := rows.Scan(&m.ID, &m.Name, &m.Type, &m.Strategy, &m.MaxTotalAttempts, &m.MaxKeysPerTarget,
-			&retry, &m.AttemptTimeoutSeconds, &created); err != nil {
+			&retry, &m.AttemptTimeoutSeconds, &bridgeEnabled, &bridgeModel, &m.VisionBridgePrompt, &created); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		m.RetryOn = []string{}
 		if retry != "" {
 			m.RetryOn = strings.Split(retry, ",")
+		}
+		m.VisionBridgeEnabled = bridgeEnabled == 1
+		if bridgeModel.Valid {
+			m.VisionBridgeModelID = &bridgeModel.Int64
+		}
+		if m.VisionBridgePrompt == "" {
+			m.VisionBridgePrompt = DefaultVisionBridgePrompt
 		}
 		m.CreatedAt = fromMS(created)
 		m.Targets = []Target{}
@@ -250,15 +315,16 @@ func (s *Store) oneModel(ctx context.Context, where string, arg any) (Model, err
 
 // CreateModel validates and inserts a model with its targets.
 func (s *Store) CreateModel(ctx context.Context, in ModelInput) (Model, error) {
-	if err := s.normalizeModel(ctx, &in); err != nil {
+	if err := s.normalizeModel(ctx, 0, &in); err != nil {
 		return Model{}, err
 	}
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO models (name, type, strategy, max_total_attempts, max_keys_per_target,
-			retry_on, attempt_timeout_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			retry_on, attempt_timeout_seconds, vision_bridge_enabled, vision_bridge_model_id, vision_bridge_prompt, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			in.Name, in.Type, in.Strategy, in.MaxTotalAttempts, in.MaxKeysPerTarget, strings.Join(in.RetryOn, ","),
-			in.AttemptTimeoutSeconds, ms(s.now()))
+			in.AttemptTimeoutSeconds, boolInt(in.VisionBridgeEnabled), in.VisionBridgeModelID, in.VisionBridgePrompt, ms(s.now()))
 		if err != nil {
 			return err
 		}
@@ -276,14 +342,15 @@ func (s *Store) CreateModel(ctx context.Context, in ModelInput) (Model, error) {
 
 // UpdateModel validates and updates a model, replacing its targets.
 func (s *Store) UpdateModel(ctx context.Context, id int64, in ModelInput) (Model, error) {
-	if err := s.normalizeModel(ctx, &in); err != nil {
+	if err := s.normalizeModel(ctx, id, &in); err != nil {
 		return Model{}, err
 	}
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE models SET name = ?, type = ?, strategy = ?, max_total_attempts = ?,
-			max_keys_per_target = ?, retry_on = ?, attempt_timeout_seconds = ? WHERE id = ?`,
+			max_keys_per_target = ?, retry_on = ?, attempt_timeout_seconds = ?,
+			vision_bridge_enabled = ?, vision_bridge_model_id = ?, vision_bridge_prompt = ? WHERE id = ?`,
 			in.Name, in.Type, in.Strategy, in.MaxTotalAttempts, in.MaxKeysPerTarget, strings.Join(in.RetryOn, ","),
-			in.AttemptTimeoutSeconds, id)
+			in.AttemptTimeoutSeconds, boolInt(in.VisionBridgeEnabled), in.VisionBridgeModelID, in.VisionBridgePrompt, id)
 		if err != nil {
 			return err
 		}

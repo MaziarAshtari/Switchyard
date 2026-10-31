@@ -8,8 +8,8 @@ import { EmptyState, ErrorState, Loading, PageHeader } from '@/components/common
 import { ConfirmDialog, type ConfirmOptions } from '@/components/ConfirmDialog'
 import { api, ApiError } from '@/lib/api'
 import { plural } from '@/lib/format'
-import { chatEndpoint, keyStrategies, labelOf } from '@/lib/labels'
-import { useAction, useProvider } from '@/lib/queries'
+import { chatEndpoint, keyRecoveryText, keyStrategies, labelOf } from '@/lib/labels'
+import { useAction, useProvider, useSettings } from '@/lib/queries'
 import type { Provider } from '@/lib/types'
 import { KeysCard } from './KeysCard'
 import { ProviderDialog } from './ProviderDialog'
@@ -54,10 +54,15 @@ export default function ProviderDetailPage() {
 
 function ProviderDetail({ provider: p }: { provider: Provider }) {
   const navigate = useNavigate()
+  const settings = useSettings()
   const [editOpen, setEditOpen] = useState(false)
   const [confirm, setConfirm] = useState<ConfirmOptions | null>(null)
   const remove = useAction(() => api.del(`/api/providers/${p.id}`), { success: 'Provider deleted' })
   const headerCount = Object.keys(p.headers ?? {}).length
+  const recovery =
+    p.disabled_key_recovery_minutes !== null
+      ? keyRecoveryText(p.disabled_key_recovery_minutes)
+      : `Default${settings.data ? ` · ${keyRecoveryText(settings.data.disabled_key_recovery_minutes).toLowerCase()}` : ''}`
 
   function confirmDelete() {
     setConfirm({
@@ -105,6 +110,7 @@ function ProviderDetail({ provider: p }: { provider: Provider }) {
           <Item label="Key selection">{labelOf(keyStrategies, p.key_strategy)}</Item>
           <Item label="Extra headers">{headerCount ? plural(headerCount, 'header') : 'None'}</Item>
           <Item label="Used by">{plural(p.model_count, 'model')}</Item>
+          <Item label="Disabled key recovery">{recovery}</Item>
         </dl>
       </Card>
 

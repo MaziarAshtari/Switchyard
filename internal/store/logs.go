@@ -47,6 +47,10 @@ type Attempt struct {
 	StatusCode    int    `json:"status_code"`
 	LatencyMS     int64  `json:"latency_ms"`
 	Error         string `json:"error"`
+	// VisionBridge marks a vision bridge sub-request rather than an upstream
+	// attempt: the public model that described an image (the sub-request is
+	// also logged on its own).
+	VisionBridge string `json:"vision_bridge,omitempty"`
 }
 
 // LogFilter selects request logs. Zero values mean "any".

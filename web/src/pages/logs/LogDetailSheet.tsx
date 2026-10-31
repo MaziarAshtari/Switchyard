@@ -6,7 +6,7 @@ import { AttemptsTable } from '@/components/AttemptsTable'
 import { HttpStatusBadge, ModelTypeBadge } from '@/components/Badges'
 import { CopyButton, ErrorState, Loading } from '@/components/common'
 import { api } from '@/lib/api'
-import { fullTime, latency } from '@/lib/format'
+import { fullTime, latency, plural } from '@/lib/format'
 import type { LogDetail } from '@/lib/types'
 
 /** Side panel with every detail of one request. Pass null to close it. */
@@ -45,6 +45,8 @@ export function LogDetailSheet({ id, onClose }: { id: number | null; onClose: ()
 function Details({ log }: { log: LogDetail }) {
   const tokens = (n: number | null) => (n === null ? '—' : n.toLocaleString())
   const noBodies = log.request_body === null && log.response_body === null
+  const bridge = (log.attempt_details ?? []).filter((a) => a.vision_bridge)
+  const upstream = (log.attempt_details ?? []).filter((a) => !a.vision_bridge)
 
   return (
     <>
@@ -85,9 +87,20 @@ function Details({ log }: { log: LogDetail }) {
         </section>
       )}
 
+      {bridge.length > 0 && (
+        <section className="grid gap-1.5">
+          <h3 className="text-sm font-medium">Vision bridge</h3>
+          <p className="text-xs text-muted-foreground">
+            {plural(bridge.length, 'image')} sent to <span className="font-mono">{bridge[0].vision_bridge}</span> for a
+            description before routing. Each call is also logged as its own request.
+          </p>
+          <AttemptsTable attempts={bridge} />
+        </section>
+      )}
+
       <section className="grid gap-1.5">
         <h3 className="text-sm font-medium">Attempts</h3>
-        <AttemptsTable attempts={log.attempt_details} />
+        <AttemptsTable attempts={upstream} />
       </section>
 
       {log.request_body !== null && <Body title="Request body" body={log.request_body} />}

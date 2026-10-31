@@ -31,9 +31,21 @@ type Provider struct {
 	ProxyID        *int64            `json:"proxy_id"`
 	ProxyName      string            `json:"proxy_name"`
 	KeyStrategy    string            `json:"key_strategy"`
-	CreatedAt      time.Time         `json:"created_at"`
-	Keys           KeyCounts         `json:"keys"`
-	ModelCount     int               `json:"model_count"`
+	// DisabledKeyRecoveryMinutes overrides the global setting; nil = use it.
+	DisabledKeyRecoveryMinutes *int      `json:"disabled_key_recovery_minutes"`
+	CreatedAt                  time.Time `json:"created_at"`
+	Keys                       KeyCounts `json:"keys"`
+	ModelCount                 int       `json:"model_count"`
+}
+
+// KeyRecovery returns how long keys of p disabled by an auth error stay
+// disabled before they become active again; 0 means until reset.
+func (p Provider) KeyRecovery(set Settings) time.Duration {
+	minutes := set.DisabledKeyRecoveryMinutes
+	if p.DisabledKeyRecoveryMinutes != nil {
+		minutes = *p.DisabledKeyRecoveryMinutes
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 // ProviderInput is the editable part of a provider.
@@ -46,6 +58,8 @@ type ProviderInput struct {
 	Enabled        bool              `json:"enabled"`
 	ProxyID        *int64            `json:"proxy_id"`
 	KeyStrategy    string            `json:"key_strategy"`
+	// DisabledKeyRecoveryMinutes: nil = use the global setting.
+	DisabledKeyRecoveryMinutes *int `json:"disabled_key_recovery_minutes"`
 }
 
 func (s *Store) normalizeProvider(ctx context.Context, in *ProviderInput) error {
@@ -72,6 +86,11 @@ func (s *Store) normalizeProvider(ctx context.Context, in *ProviderInput) error 
 	}
 	if !contains(KeyStrategies, in.KeyStrategy) {
 		errs["key_strategy"] = "Choose round_robin, random or least_recently_used"
+	}
+	if in.DisabledKeyRecoveryMinutes != nil {
+		if msg := checkKeyRecovery(*in.DisabledKeyRecoveryMinutes); msg != "" {
+			errs["disabled_key_recovery_minutes"] = msg
+		}
 	}
 	headers := map[string]string{}
 	for k, v := range in.Headers {
@@ -108,26 +127,31 @@ func validHeaderName(k string) bool {
 }
 
 const providerSelect = `SELECT p.id, p.name, p.type, p.base_url, p.headers, p.timeout_seconds, p.enabled,
-	p.proxy_id, COALESCE(px.name, ''), p.key_strategy, p.created_at,
+	p.proxy_id, COALESCE(px.name, ''), p.key_strategy, p.disabled_key_recovery_minutes, p.created_at,
 	(SELECT COUNT(DISTINCT t.model_id) FROM model_targets t WHERE t.provider_id = p.id)
 	FROM providers p LEFT JOIN proxies px ON px.id = p.proxy_id`
 
 func scanProvider(row interface{ Scan(...any) error }) (Provider, error) {
 	var (
-		p       Provider
-		headers string
-		enabled int
-		proxyID sql.NullInt64
-		created int64
+		p        Provider
+		headers  string
+		enabled  int
+		proxyID  sql.NullInt64
+		recovery sql.NullInt64
+		created  int64
 	)
 	err := row.Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &headers, &p.TimeoutSeconds, &enabled,
-		&proxyID, &p.ProxyName, &p.KeyStrategy, &created, &p.ModelCount)
+		&proxyID, &p.ProxyName, &p.KeyStrategy, &recovery, &created, &p.ModelCount)
 	if err != nil {
 		return p, err
 	}
 	p.Enabled = enabled == 1
 	if proxyID.Valid {
 		p.ProxyID = &proxyID.Int64
+	}
+	if recovery.Valid {
+		minutes := int(recovery.Int64)
+		p.DisabledKeyRecoveryMinutes = &minutes
 	}
 	p.CreatedAt = fromMS(created)
 	p.Headers = map[string]string{}
@@ -191,10 +215,10 @@ func (s *Store) CreateProvider(ctx context.Context, in ProviderInput) (Provider,
 	}
 	headers, _ := json.Marshal(in.Headers)
 	res, err := s.db.ExecContext(ctx, `INSERT INTO providers
-		(name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy, disabled_key_recovery_minutes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		in.Name, in.Type, in.BaseURL, string(headers), in.TimeoutSeconds, boolInt(in.Enabled), in.ProxyID,
-		in.KeyStrategy, ms(s.now()))
+		in.KeyStrategy, in.DisabledKeyRecoveryMinutes, ms(s.now()))
 	if isUnique(err) {
 		return Provider{}, FieldErrors{"name": "A provider with this name already exists"}
 	}
@@ -212,9 +236,9 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in ProviderInput) 
 	}
 	headers, _ := json.Marshal(in.Headers)
 	res, err := s.db.ExecContext(ctx, `UPDATE providers SET name = ?, type = ?, base_url = ?, headers = ?,
-		timeout_seconds = ?, enabled = ?, proxy_id = ?, key_strategy = ? WHERE id = ?`,
+		timeout_seconds = ?, enabled = ?, proxy_id = ?, key_strategy = ?, disabled_key_recovery_minutes = ? WHERE id = ?`,
 		in.Name, in.Type, in.BaseURL, string(headers), in.TimeoutSeconds, boolInt(in.Enabled), in.ProxyID,
-		in.KeyStrategy, id)
+		in.KeyStrategy, in.DisabledKeyRecoveryMinutes, id)
 	if isUnique(err) {
 		return Provider{}, FieldErrors{"name": "A provider with this name already exists"}
 	}

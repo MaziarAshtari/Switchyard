@@ -33,8 +33,9 @@ type APIKey struct {
 	ProxyMode      string     `json:"proxy_mode"`
 	ProxyID        *int64     `json:"proxy_id"`
 	EffectiveProxy *ProxyRef  `json:"effective_proxy"` // nil means direct
-	Status         string     `json:"status"`          // effective: expired cooldowns read as active
+	Status         string     `json:"status"`          // effective: expired cooldowns and recoveries read as active
 	CooldownUntil  *time.Time `json:"cooldown_until"`
+	DisabledUntil  *time.Time `json:"disabled_until"` // automatic re-activation of a disabled key; nil = by reset only
 	LastError      string     `json:"last_error"`
 	LastUsedAt     *time.Time `json:"last_used_at"`
 	SuccessCount   int64      `json:"success_count"`
@@ -63,6 +64,9 @@ func (k APIKey) RoutingKey() routing.Key {
 	rk := routing.Key{ID: k.ID, Enabled: k.Enabled, Status: k.Status, ProxyOK: k.ProxyOK()}
 	if k.CooldownUntil != nil {
 		rk.CooldownUntil = *k.CooldownUntil
+	}
+	if k.DisabledUntil != nil {
+		rk.DisabledUntil = *k.DisabledUntil
 	}
 	if k.LastUsedAt != nil {
 		rk.LastUsedAt = *k.LastUsedAt
@@ -124,7 +128,7 @@ type LineError struct {
 }
 
 const keySelect = `SELECT k.id, k.provider_id, p.name, k.label, k.secret_hint, k.enabled, k.proxy_mode, k.proxy_id,
-	k.status, k.cooldown_until, k.last_error, k.last_used_at, k.success_count, k.failure_count, k.created_at,
+	k.status, k.cooldown_until, k.disabled_until, k.last_error, k.last_used_at, k.success_count, k.failure_count, k.created_at,
 	px.id, px.name, px.enabled
 	FROM api_keys k
 	JOIN providers p ON p.id = k.provider_id
@@ -133,14 +137,14 @@ const keySelect = `SELECT k.id, k.provider_id, p.name, k.label, k.secret_hint, k
 
 func (s *Store) scanKey(row interface{ Scan(...any) error }) (APIKey, error) {
 	var (
-		k                          APIKey
-		enabled                    int
-		proxyID, pxID, pxEnabled   sql.NullInt64
-		pxName                     sql.NullString
-		cooldown, lastUsed, create int64
+		k                                    APIKey
+		enabled                              int
+		proxyID, pxID, pxEnabled             sql.NullInt64
+		pxName                               sql.NullString
+		cooldown, disabled, lastUsed, create int64
 	)
 	err := row.Scan(&k.ID, &k.ProviderID, &k.ProviderName, &k.Label, &k.SecretHint, &enabled, &k.ProxyMode, &proxyID,
-		&k.Status, &cooldown, &k.LastError, &lastUsed, &k.SuccessCount, &k.FailureCount, &create,
+		&k.Status, &cooldown, &disabled, &k.LastError, &lastUsed, &k.SuccessCount, &k.FailureCount, &create,
 		&pxID, &pxName, &pxEnabled)
 	if err != nil {
 		return k, err
@@ -152,16 +156,27 @@ func (s *Store) scanKey(row interface{ Scan(...any) error }) (APIKey, error) {
 	if pxID.Valid {
 		k.EffectiveProxy = &ProxyRef{ID: pxID.Int64, Name: pxName.String, Enabled: pxEnabled.Int64 == 1}
 	}
-	if k.Status == routing.StatusCoolingDown {
-		if cooldown > ms(s.now()) {
-			k.CooldownUntil = optTime(cooldown)
-		} else {
-			k.Status = routing.StatusActive
-		}
+	k.Status = effectiveStatus(k.Status, cooldown, disabled, ms(s.now()))
+	switch k.Status {
+	case routing.StatusCoolingDown:
+		k.CooldownUntil = optTime(cooldown)
+	case routing.StatusDisabled:
+		k.DisabledUntil = optTime(disabled)
 	}
 	k.LastUsedAt = optTime(lastUsed)
 	k.CreatedAt = fromMS(create)
 	return k, nil
+}
+
+// effectiveStatus is the status a key has at now: expired cooldowns and
+// passed recovery times read as active although the row keeps the old status.
+func effectiveStatus(status string, cooldownUntil, disabledUntil, now int64) string {
+	switch {
+	case status == routing.StatusCoolingDown && cooldownUntil <= now,
+		status == routing.StatusDisabled && disabledUntil != 0 && disabledUntil <= now:
+		return routing.StatusActive
+	}
+	return status
 }
 
 func (s *Store) queryKeys(ctx context.Context, where string, args ...any) ([]APIKey, error) {
@@ -202,7 +217,7 @@ func (s *Store) GetKey(ctx context.Context, id int64) (APIKey, error) {
 }
 
 func (s *Store) keyCounts(ctx context.Context) (map[int64]KeyCounts, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT provider_id, enabled, status, cooldown_until FROM api_keys`)
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_id, enabled, status, cooldown_until, disabled_until FROM api_keys`)
 	if err != nil {
 		return nil, err
 	}
@@ -211,18 +226,15 @@ func (s *Store) keyCounts(ctx context.Context) (map[int64]KeyCounts, error) {
 	out := map[int64]KeyCounts{}
 	for rows.Next() {
 		var (
-			pid, cooldown int64
-			enabled       int
-			status        string
+			pid, cooldown, disabled int64
+			enabled                 int
+			status                  string
 		)
-		if err := rows.Scan(&pid, &enabled, &status, &cooldown); err != nil {
+		if err := rows.Scan(&pid, &enabled, &status, &cooldown, &disabled); err != nil {
 			return nil, err
 		}
-		if status == routing.StatusCoolingDown && cooldown <= now {
-			status = routing.StatusActive
-		}
 		c := out[pid]
-		c.add(enabled == 1, status)
+		c.add(enabled == 1, effectiveStatus(status, cooldown, disabled, now))
 		out[pid] = c
 	}
 	return out, rows.Err()
@@ -383,9 +395,13 @@ func (s *Store) DeleteKey(ctx context.Context, id int64) error {
 	return nil
 }
 
+// resetKeys is the SET clause that re-activates keys. It never touches the
+// user's enabled switch.
+const resetKeys = `SET status = 'active', cooldown_until = 0, disabled_until = 0`
+
 // ResetKey re-activates a key: clears a cooldown or an automatic disable.
 func (s *Store) ResetKey(ctx context.Context, id int64) (APIKey, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE api_keys `+resetKeys+` WHERE id = ?`, id)
 	if err != nil {
 		return APIKey{}, err
 	}
@@ -393,6 +409,24 @@ func (s *Store) ResetKey(ctx context.Context, id int64) (APIKey, error) {
 		return APIKey{}, ErrNotFound
 	}
 	return s.GetKey(ctx, id)
+}
+
+// ResetProviderKeys re-activates every disabled or cooling-down key of a
+// provider and returns how many there were.
+func (s *Store) ResetProviderKeys(ctx context.Context, providerID int64) (int, error) {
+	if err := s.providerExists(ctx, providerID); err != nil {
+		return 0, err
+	}
+	// Only keys that are still disabled or cooling down count; expired states already read as active.
+	now := ms(s.now())
+	res, err := s.db.ExecContext(ctx, `UPDATE api_keys `+resetKeys+` WHERE provider_id = ?
+		AND (status = 'disabled' AND (disabled_until = 0 OR disabled_until > ?) OR status = 'cooling_down' AND cooldown_until > ?)`,
+		providerID, now, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // Batch actions on keys.
@@ -407,7 +441,7 @@ func (s *Store) BatchKeys(ctx context.Context, ids []int64, action string) (int,
 	case "disable":
 		query = `UPDATE api_keys SET enabled = 0 WHERE id = ?`
 	case "reset":
-		query = `UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE id = ?`
+		query = `UPDATE api_keys ` + resetKeys + ` WHERE id = ?`
 	case "delete":
 		query = `DELETE FROM api_keys WHERE id = ?`
 	default:
@@ -469,13 +503,15 @@ func (s *Store) RecordKeyOutcome(ctx context.Context, id int64, d routing.Decisi
 		query, args = `UPDATE api_keys SET last_used_at = ?, failure_count = failure_count + 1, last_error = ? WHERE id = ?`,
 			[]any{now, errMsg, id}
 	case routing.KeyCooldown:
+		// A cooldown never re-activates a key that is still disabled.
 		query = `UPDATE api_keys SET last_used_at = ?, failure_count = failure_count + 1, last_error = ?,
-			status = CASE WHEN status = 'disabled' THEN status ELSE 'cooling_down' END, cooldown_until = ? WHERE id = ?`
-		args = []any{now, errMsg, ms(d.CooldownUntil), id}
+			status = CASE WHEN status = 'disabled' AND (disabled_until = 0 OR disabled_until > ?) THEN status ELSE 'cooling_down' END,
+			cooldown_until = ? WHERE id = ?`
+		args = []any{now, errMsg, now, ms(d.CooldownUntil), id}
 	case routing.KeyDisable:
 		query = `UPDATE api_keys SET last_used_at = ?, failure_count = failure_count + 1, last_error = ?,
-			status = 'disabled', cooldown_until = 0 WHERE id = ?`
-		args = []any{now, errMsg, id}
+			status = 'disabled', cooldown_until = 0, disabled_until = ? WHERE id = ?`
+		args = []any{now, errMsg, ms(d.DisabledUntil), id}
 	case routing.KeyUsed:
 		query, args = `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, []any{now, id}
 	default:

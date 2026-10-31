@@ -32,7 +32,8 @@ internal/adapter        canonical chat types + Inbound/Upstream interfaces
 internal/adapter/openai     OpenAI chat format (inbound + upstream)
 internal/adapter/anthropic  Anthropic Messages format (inbound + upstream)
 internal/adapter/gemini     Gemini generateContent format (upstream only)
-internal/gateway        /v1 handlers: auth, pipeline, attempts, streaming, logging
+internal/gateway        /v1 handlers: auth, pipeline, attempts, streaming, logging,
+                        vision bridge pre-processor
 internal/admin          /api handlers for the GUI, sessions, login rate limit
 internal/server         chi router wiring + embedded GUI serving
 web/                    React + TypeScript + Vite + Tailwind + shadcn/ui GUI
@@ -45,14 +46,17 @@ standard library (SOCKS5 proxies are supported natively by `net/http`).
 
 ```
 providers      id, name, type(openai|anthropic|gemini), base_url, headers(JSON),
-               timeout_seconds, enabled, proxy_id?, key_strategy
+               timeout_seconds, enabled, proxy_id?, key_strategy,
+               disabled_key_recovery_minutes? (NULL = Settings default)
 api_keys       id, provider_id, label, secret_enc, secret_hash, secret_hint, enabled,
                proxy_mode(inherit|direct|specific), proxy_id?,
-               status(active|cooling_down|disabled), cooldown_until, last_error,
-               last_used_at, success_count, failure_count
+               status(active|cooling_down|disabled), cooldown_until, disabled_until,
+               last_error, last_used_at, success_count, failure_count
 proxies        id, name, type(http|https|socks5), host, port, username, password_enc, enabled
 models         id, name (public), type(chat|embedding|image|video|tts|asr), strategy,
-               max_total_attempts, max_keys_per_target, retry_on, attempt_timeout_seconds
+               max_total_attempts, max_keys_per_target (1-200), retry_on,
+               attempt_timeout_seconds, vision_bridge_enabled, vision_bridge_model_id?,
+               vision_bridge_prompt
 model_targets  id, model_id, position (= priority), provider_id, upstream_model, weight, enabled
 gateway_keys   id, name, secret_hash, secret_hint, enabled
 request_logs   id, created_at, endpoint, model, model_type, provider, key_hint,
@@ -60,8 +64,12 @@ request_logs   id, created_at, endpoint, model, model_type, provider, key_hint,
                attempts, error, attempt_details(JSON), request_body?, response_body?
 video_jobs     id (upstream video id), model, provider_id, key_id
 sessions       token_hash, expires_at
-settings       key/value (password hash, retention, cooldown, body logging, proxy test URL)
+settings       key/value (password hash, retention, cooldown, key recovery, body logging,
+               proxy test URL)
 ```
+
+A key's `enabled` flag is the user's on/off switch; `status` is runtime state driven by
+upstream responses. Automatic changes only ever touch `status`.
 
 Times are stored as Unix milliseconds. Secrets are stored encrypted (`secret_enc`,
 `password_enc`) and are never returned by the API; `secret_hint` is the masked form.
@@ -76,13 +84,14 @@ auth (gateway key) -> resolve model -> [pre-processors] -> route/retry -> adapte
    gateway key (compared by SHA-256 hash).
 2. **Resolve**: read the body, take the `model` field (JSON or multipart), load the public
    model and its targets. The model type must match the endpoint.
-3. **Pre-processors**: `gateway.PreProcessor` hook (no implementations yet).
+3. **Pre-processors**: `gateway.PreProcessor` hook. The [vision bridge](#vision-bridge) is the
+   one implementation; a pre-processor may rewrite the body or reject the request.
 4. **Route/retry**: `routing.Plan` yields attempts `(target, key)`:
    - targets are ordered by the model strategy (priority / round_robin / weighted / random);
      whatever comes first, the rest follow as failover;
    - keys of the target's provider are ordered by the provider key strategy
-     (round_robin / random / least_recently_used), skipping disabled, cooling-down keys and
-     keys whose proxy is disabled;
+     (round_robin / random / least_recently_used), skipping keys switched off, disabled or
+     cooling down, and keys whose proxy is disabled;
    - `max_keys_per_target` and `max_total_attempts` bound the loop.
    Each outcome is classified by `routing.Decide`:
 
@@ -90,10 +99,17 @@ auth (gateway key) -> resolve model -> [pre-processors] -> route/retry -> adapte
    |------------------------------|--------------------------------------|-------------------------|
    | 2xx                          | success counter, status active       | no (done)               |
    | 429                          | cooldown (Retry-After or default)    | if `retry_on` has 429   |
-   | 401 / 402 / 403              | disabled + last_error                | yes, next key           |
+   | 401 / 402 / 403              | disabled + last_error (+ recovery)   | yes, next key           |
    | 5xx                          | failure counter                      | if `retry_on` has 5xx   |
    | timeout / connection error   | failure counter                      | if `retry_on` has it    |
    | other 4xx                    | none                                 | no, error to client     |
+
+   **Key recovery**: when the provider's recovery period (its own value, else the Settings
+   value) is above 0, a disabled key gets `disabled_until = now + period`. Like an expired
+   cooldown, a passed `disabled_until` reads as `active` everywhere (API, key counts,
+   routing), so no background job is needed. 0 keeps the key disabled until it is reset.
+   "Reset disabled keys" (`POST /api/providers/{id}/keys/reset`) re-activates all disabled
+   and cooling-down keys of a provider; it never switches keys on.
 
 5. **Adapter**: for each attempt the key's proxy is resolved (specific / provider default /
    direct) and the matching cached `http.Client` is used. Chat requests are translated:
@@ -112,6 +128,29 @@ Timeouts: the model's *attempt timeout* bounds an attempt until the response is 
 the client (whole non-streaming exchange, or until the first stream event). The provider's
 *request timeout* caps the entire upstream request, including a long stream.
 
+## Vision bridge
+
+Chat models can turn on a vision bridge (`vision_bridge_enabled`, `vision_bridge_model_id`,
+`vision_bridge_prompt`) so that clients can send images to a model whose targets cannot see.
+The pre-processor runs only when the bridge is on and the client body (OpenAI
+`/v1/chat/completions` or Anthropic `/v1/messages`) contains image parts:
+
+1. Find the image parts: OpenAI `image_url` parts (http(s) URL or base64 data URI) and
+   Anthropic `image` blocks (base64 or URL source), also inside Anthropic `tool_result`
+   content.
+2. For each image, send a non-streaming OpenAI-format request to the vision model through
+   the gateway's own pipeline (routing, retries, key outcomes, logging): the prompt, the text
+   of the same message as context, and the image. The context of this sub-request carries a
+   marker, so the bridge never runs inside it (depth 1).
+3. Replace the image part with the text part `[Image description]: <description>` and route
+   the rewritten body as usual (passthrough or translation).
+
+Each sub-request is logged as a request of its own (usage, attempts, errors). The parent's
+log entry lists them in its attempt details marked `vision_bridge` (shown as "Vision bridge"
+in the GUI; they do not count as attempts). If a sub-request fails after its retries, the
+client request fails with "Vision bridge failed: ..." and the sub-request's status, and the
+main model is not called.
+
 ## Protocol adapters
 
 `internal/adapter` defines a protocol-neutral chat model (system prompt, messages made of
@@ -127,7 +166,8 @@ means adding one package that implements `Upstream`.
 ## Admin API (`/api/*`)
 
 Session cookie (`HttpOnly`, `SameSite=Strict`) obtained via `POST /api/auth/login`; login
-attempts are rate limited per IP. Resources: `providers`, `providers/{id}/keys`, `keys`,
+attempts are rate limited per IP. Resources: `providers`, `providers/{id}/keys` (+ `bulk`,
+`reset`), `keys`,
 `proxies` (+ `import`, `test`, `assign`), `models` (+ `test`), `logs`, `dashboard`,
 `settings`, `gateway-keys`. Errors are `{"error": "...", "fields": {...}}`.
 
