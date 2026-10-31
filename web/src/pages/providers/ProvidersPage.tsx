@@ -17,8 +17,8 @@ import type { Provider, ProviderInput } from '@/lib/types'
 import { ProviderDialog } from './ProviderDialog'
 
 function toInput(p: Provider, patch: Partial<ProviderInput> = {}): ProviderInput {
-  const { name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy } = p
-  return { name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy, ...patch }
+  const { name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy, disabled_key_recovery_minutes } = p
+  return { name, type, base_url, headers, timeout_seconds, enabled, proxy_id, key_strategy, disabled_key_recovery_minutes, ...patch }
 }
 
 export default function ProvidersPage() {

@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/switch'
 import { ErrorState, Field, FormError, Loading, PageHeader } from '@/components/common'
 import { api, ApiError } from '@/lib/api'
 import { intInRange, toErrors, useFormState, type Errors } from '@/lib/form'
+import { maxKeyRecoveryMinutes } from '@/lib/labels'
 import { useAction, useSettings } from '@/lib/queries'
 import type { Settings } from '@/lib/types'
 import { GatewayKeysCard } from './GatewayKeysCard'
@@ -39,6 +40,7 @@ function GeneralCard({ settings }: { settings: Settings }) {
     log_bodies: settings.log_bodies,
     body_kb: String(Math.max(1, Math.round(settings.log_body_max_bytes / 1024))),
     default_cooldown_seconds: String(settings.default_cooldown_seconds),
+    disabled_key_recovery_minutes: String(settings.disabled_key_recovery_minutes),
     proxy_test_url: settings.proxy_test_url,
   }))
   const [errors, setErrors] = useState<Errors>({})
@@ -56,10 +58,12 @@ function GeneralCard({ settings }: { settings: Settings }) {
     if (kb === null) errs.log_body_max_bytes = 'Enter a size from 1 to 10240 KB (10 MB)'
     const cooldown = intInRange(values.default_cooldown_seconds, 1, 86400)
     if (cooldown === null) errs.default_cooldown_seconds = 'Enter a number of seconds from 1 to 86400'
+    const recovery = intInRange(values.disabled_key_recovery_minutes, 0, maxKeyRecoveryMinutes)
+    if (recovery === null) errs.disabled_key_recovery_minutes = `Enter a number of minutes from 0 to ${maxKeyRecoveryMinutes}`
     const url = values.proxy_test_url.trim()
     if (!/^https?:\/\/\S+$/i.test(url)) errs.proxy_test_url = 'Enter a URL starting with http:// or https://'
     setErrors(errs)
-    if (Object.keys(errs).length > 0 || retention === null || kb === null || cooldown === null) return
+    if (Object.keys(errs).length > 0 || retention === null || kb === null || cooldown === null || recovery === null) return
 
     save.mutate(
       {
@@ -67,6 +71,7 @@ function GeneralCard({ settings }: { settings: Settings }) {
         log_bodies: values.log_bodies,
         log_body_max_bytes: kb * 1024,
         default_cooldown_seconds: cooldown,
+        disabled_key_recovery_minutes: recovery,
         proxy_test_url: url,
       },
       {
@@ -81,7 +86,7 @@ function GeneralCard({ settings }: { settings: Settings }) {
     <Card>
       <CardHeader>
         <CardTitle>General</CardTitle>
-        <CardDescription>Request logging, cooldowns and proxy tests.</CardDescription>
+        <CardDescription>Request logging, key cooldowns and recovery, proxy tests.</CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={submit} className="grid gap-4" noValidate>
@@ -113,6 +118,20 @@ function GeneralCard({ settings }: { settings: Settings }) {
                 value={values.default_cooldown_seconds}
                 onChange={(e) => set('default_cooldown_seconds', e.target.value)}
                 aria-invalid={!!errors.default_cooldown_seconds}
+              />
+            </Field>
+            <Field
+              label="Disabled key recovery (minutes)"
+              htmlFor="settings-recovery"
+              error={errors.disabled_key_recovery_minutes}
+              help="Keys disabled by a 401/402/403 response become active again after this long. 0 = never. Providers can override it."
+            >
+              <Input
+                id="settings-recovery"
+                inputMode="numeric"
+                value={values.disabled_key_recovery_minutes}
+                onChange={(e) => set('disabled_key_recovery_minutes', e.target.value)}
+                aria-invalid={!!errors.disabled_key_recovery_minutes}
               />
             </Field>
           </div>

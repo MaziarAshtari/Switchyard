@@ -9,7 +9,9 @@ according to rules you configure in a web GUI.
 - Upstream providers of type **openai**, **anthropic** or **gemini** (any compatible base URL);
   chat requests are translated between formats, including streaming, images and tool calls
 - Per model: ordered targets (drag to reorder), routing strategy, retry policy
-- Per provider: many keys, key selection strategy, automatic cooldown on 429 and disabling on 401/403
+- Per provider: many keys, key selection strategy, automatic cooldown on 429 and disabling on
+  401/402/403 (optionally re-activated after a recovery period)
+- Vision bridge: chat models without vision accept images, which a vision model describes first
 - HTTP, HTTPS and SOCKS5 proxies per key or per provider, bulk import and bulk assignment
 - Request logs with per-attempt details, a dashboard, light and dark mode
 - One binary (GUI embedded), one SQLite file, secrets encrypted at rest
@@ -66,7 +68,8 @@ Upgrade with `git pull && docker compose up -d --build`.
 | `ADMIN_PASSWORD` | –        | Initial GUI password, required on first start (min. 8 characters). Later changes are made in Settings. |
 | `ENCRYPTION_KEY` | –        | Required, min. 16 characters. Encrypts upstream API keys and proxy passwords (AES-GCM). Never change it after the first start. |
 
-Everything else (log retention, default cooldown, body logging, proxy test URL) is in **Settings**.
+Everything else (log retention, default cooldown, disabled key recovery, body logging, proxy test
+URL) is in **Settings**.
 
 **Forgot the password?** Set a new one with:
 
@@ -230,7 +233,7 @@ strategy decides which target goes first (priority, round robin, weighted, rando
 others follow as failover. Within a target, the provider's key strategy picks keys (round
 robin, random, least recently used), skipping disabled keys, keys cooling down and keys whose
 proxy is disabled. A 429 cools the key down (Retry-After or the default cooldown), 401/402/403
-disable it, 5xx/timeouts/connection errors move on, other 4xx errors go straight back to the
+disable it (until reset, or until the recovery period has passed), 5xx/timeouts/connection errors move on, other 4xx errors go straight back to the
 client. `max_keys_per_target` and `max_total_attempts` bound the attempts. Streams are retried
 only before the first byte reaches the client.
 

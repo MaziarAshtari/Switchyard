@@ -175,13 +175,64 @@ func TestDecide(t *testing.T) {
 		{"404", Outcome{Status: 404}, all, Decision{Action: KeyUsed}, 0},
 	}
 	for _, c := range cases {
-		got := Decide(c.o, c.retry, t0, def)
+		got := Decide(c.o, c.retry, t0, def, 0)
 		if c.wantCD > 0 {
 			c.want.CooldownUntil = t0.Add(c.wantCD)
 		}
 		if got != c.want {
 			t.Errorf("%s: got %+v, want %+v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestDecideKeyRecovery(t *testing.T) {
+	retry := RetryOn{RateLimit: true}
+	for _, status := range []int{401, 402, 403} {
+		d := Decide(Outcome{Status: status}, retry, t0, time.Minute, 30*time.Minute)
+		if d.Action != KeyDisable || !d.DisabledUntil.Equal(t0.Add(30*time.Minute)) {
+			t.Errorf("%d with recovery: %+v", status, d)
+		}
+	}
+	if d := Decide(Outcome{Status: 401}, retry, t0, time.Minute, 0); !d.DisabledUntil.IsZero() {
+		t.Errorf("without recovery a key stays disabled until reset: %+v", d)
+	}
+	if d := Decide(Outcome{Status: 429}, retry, t0, time.Minute, 30*time.Minute); !d.DisabledUntil.IsZero() {
+		t.Errorf("recovery only applies to disabled keys: %+v", d)
+	}
+}
+
+func TestDisabledKeyBecomesAvailableAtRecoveryTime(t *testing.T) {
+	k := Key{ID: 1, Enabled: true, Status: StatusDisabled, ProxyOK: true, DisabledUntil: t0.Add(time.Minute)}
+	if k.Available(t0) || !k.Available(t0.Add(time.Minute)) {
+		t.Fatal("a disabled key must become available at its recovery time")
+	}
+	k.Enabled = false
+	if k.Available(t0.Add(time.Hour)) {
+		t.Fatal("a key switched off by the user must never become available")
+	}
+	if forever := (Key{ID: 2, Enabled: true, Status: StatusDisabled, ProxyOK: true}); forever.Available(t0.Add(24 * time.Hour)) {
+		t.Fatal("a disabled key without recovery time must stay unavailable")
+	}
+}
+
+func TestPlanUsesTheTargetsKeyRecovery(t *testing.T) {
+	r, _ := newRouter(1)
+	targets := []Target{
+		{ID: 10, ProviderID: 1, KeyRecovery: 5 * time.Minute, Enabled: true},
+		{ID: 20, ProviderID: 2, Enabled: true},
+	}
+	keys := map[int64][]Key{1: {activeKey(1)}, 2: {activeKey(2)}}
+	p := r.NewPlan(1, defaultPolicy(), targets, source(keys))
+	var got []time.Time
+	for {
+		a, ok := p.Next()
+		if !ok {
+			break
+		}
+		got = append(got, p.Report(a, Outcome{Status: 401}).DisabledUntil)
+	}
+	if len(got) != 2 || !got[0].Equal(t0.Add(5*time.Minute)) || !got[1].IsZero() {
+		t.Fatalf("disabled until per attempt = %v", got)
 	}
 }
 

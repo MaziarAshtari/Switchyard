@@ -17,8 +17,8 @@ import { Switch } from '@/components/ui/switch'
 import { Field, FormError } from '@/components/common'
 import { api } from '@/lib/api'
 import { intInRange, toErrors, useFormState, type Errors } from '@/lib/form'
-import { chatEndpoint, defaultBaseUrls, keyStrategies, providerTypes } from '@/lib/labels'
-import { useAction, useProxies } from '@/lib/queries'
+import { chatEndpoint, defaultBaseUrls, keyRecoveryText, keyStrategies, maxKeyRecoveryMinutes, providerTypes } from '@/lib/labels'
+import { useAction, useProxies, useSettings } from '@/lib/queries'
 import type { KeyStrategy, Provider, ProviderInput, ProviderType } from '@/lib/types'
 
 interface ProviderDialogProps {
@@ -51,6 +51,8 @@ interface FormValues {
   enabled: boolean
   proxy_id: number | null
   key_strategy: KeyStrategy
+  /** "" = Settings default */
+  disabled_key_recovery_minutes: string
 }
 
 function initialValues(p?: Provider): FormValues {
@@ -63,6 +65,7 @@ function initialValues(p?: Provider): FormValues {
     enabled: p?.enabled ?? true,
     proxy_id: p?.proxy_id ?? null,
     key_strategy: p?.key_strategy ?? 'round_robin',
+    disabled_key_recovery_minutes: p?.disabled_key_recovery_minutes == null ? '' : String(p.disabled_key_recovery_minutes),
   }
 }
 
@@ -74,6 +77,11 @@ function validate(v: FormValues): { input?: ProviderInput; errors: Errors } {
   else if (!/^https?:\/\/\S+$/i.test(baseUrl)) errors.base_url = 'Must start with http:// or https://'
   const timeout = intInRange(v.timeout_seconds, 1, 3600)
   if (timeout === null) errors.timeout_seconds = 'Enter a number of seconds from 1 to 3600'
+  const recoveryText = v.disabled_key_recovery_minutes.trim()
+  const recovery = recoveryText ? intInRange(recoveryText, 0, maxKeyRecoveryMinutes) : null
+  if (recoveryText && recovery === null) {
+    errors.disabled_key_recovery_minutes = `Enter minutes from 0 to ${maxKeyRecoveryMinutes}, or leave empty for the default`
+  }
 
   const headers: Record<string, string> = {}
   for (const row of v.headers) {
@@ -102,12 +110,14 @@ function validate(v: FormValues): { input?: ProviderInput; errors: Errors } {
       enabled: v.enabled,
       proxy_id: v.proxy_id,
       key_strategy: v.key_strategy,
+      disabled_key_recovery_minutes: recovery,
     },
   }
 }
 
 function ProviderForm({ provider, onDone }: { provider?: Provider; onDone: () => void }) {
   const proxies = useProxies()
+  const settings = useSettings()
   const [values, set, setValues] = useFormState(() => initialValues(provider))
   const [errors, setErrors] = useState<Errors>({})
   const save = useAction(
@@ -141,6 +151,7 @@ function ProviderForm({ provider, onDone }: { provider?: Provider; onDone: () =>
 
   const endpoint = chatEndpoint(values.type, values.base_url)
   const strategyHelp = keyStrategies.find((s) => s.value === values.key_strategy)?.help
+  const defaultRecovery = settings.data ? keyRecoveryText(settings.data.disabled_key_recovery_minutes).toLowerCase() : ''
 
   return (
     <form onSubmit={submit} className="grid gap-4" noValidate>
@@ -285,20 +296,37 @@ function ProviderForm({ provider, onDone }: { provider?: Provider; onDone: () =>
         </Field>
       </div>
 
-      <Field label="Key selection" htmlFor="provider-strategy" error={errors.key_strategy} help={strategyHelp}>
-        <Select value={values.key_strategy} onValueChange={(v) => set('key_strategy', v as KeyStrategy)}>
-          <SelectTrigger id="provider-strategy" className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {keyStrategies.map((s) => (
-              <SelectItem key={s.value} value={s.value}>
-                {s.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Key selection" htmlFor="provider-strategy" error={errors.key_strategy} help={strategyHelp}>
+          <Select value={values.key_strategy} onValueChange={(v) => set('key_strategy', v as KeyStrategy)}>
+            <SelectTrigger id="provider-strategy" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {keyStrategies.map((s) => (
+                <SelectItem key={s.value} value={s.value}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field
+          label="Disabled key recovery (minutes)"
+          htmlFor="provider-recovery"
+          error={errors.disabled_key_recovery_minutes}
+          help="Re-activates keys disabled by 401/402/403. Empty = Settings default, 0 = never."
+        >
+          <Input
+            id="provider-recovery"
+            inputMode="numeric"
+            value={values.disabled_key_recovery_minutes}
+            onChange={(e) => set('disabled_key_recovery_minutes', e.target.value)}
+            placeholder={defaultRecovery ? `Default (${defaultRecovery})` : 'Default'}
+            aria-invalid={!!errors.disabled_key_recovery_minutes}
+          />
+        </Field>
+      </div>
 
       <label className="flex items-center justify-between gap-4 rounded-md border p-3">
         <span className="grid gap-0.5">

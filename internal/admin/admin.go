@@ -61,6 +61,7 @@ func (a *API) Routes(r chi.Router) {
 			r.Get("/providers/{id}/keys", a.listProviderKeys)
 			r.Post("/providers/{id}/keys", a.createKey)
 			r.Post("/providers/{id}/keys/bulk", a.bulkAddKeys)
+			r.Post("/providers/{id}/keys/reset", a.resetProviderKeys)
 
 			r.Get("/keys", a.listAllKeys)
 			r.Post("/keys/batch", a.batchKeys)

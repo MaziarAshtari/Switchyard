@@ -130,3 +130,49 @@ what was decided and why.
     needed. A test performs a real SOCKS5 handshake with authentication.
 48. **CSRF protection** uses `http.CrossOriginProtection` from the standard library on top
     of the `SameSite=Strict` session cookie.
+
+## Retry limits and key recovery
+
+49. **Retry limits go up to 200** for both `max_total_attempts` and `max_keys_per_target`, for
+    providers with large key pools.
+50. **"Switched off" and "disabled" stay separate.** The on/off switch (`enabled`) belongs to
+    the user; `status = disabled` is set by 401/402/403 responses. Recovery and "Reset" only
+    change `status`, so a key the user switched off never comes back on by itself (a key that
+    is both disabled and switched off is still off after it recovers).
+51. **Recovery is a timestamp, not a job.** A separate `disabled_until` column holds the
+    re-activation time (`cooldown_until` is not reused: a concurrent 429 could overwrite it).
+    A passed `disabled_until` reads as active, exactly like an expired cooldown, so recovery
+    happens on time without a background task. A 429 on a recovered key cools it down
+    normally.
+52. **Recovery period**: minutes, set in Settings (default 0 = never, the previous behaviour,
+    at most one year) and optionally per provider (empty = use the Settings value). The
+    period that applies is fixed when the key is disabled.
+53. **"Reset disabled keys" also clears cooldowns** and counts only keys that were still
+    disabled or cooling down.
+
+## Vision bridge
+
+54. **The bridge is a pre-processor that rewrites the client body**, so it works for
+    same-format passthrough and translation alike. Only image parts change: OpenAI
+    `image_url` parts and Anthropic `image` blocks, including those inside `tool_result`
+    (where Claude Code puts screenshots). Anthropic images given as `file` references cannot
+    be passed on and are left unchanged. A replaced Anthropic block keeps its `cache_control`.
+55. **One sub-request per image, through the gateway itself**: a non-streaming OpenAI-format
+    chat request to the vision model with the prompt, the image and, as context, the text of
+    the same message or tool result (truncated to 4,000 bytes). It uses the vision model's
+    own targets, retries, timeouts and key handling and is logged as a request of its own,
+    so its usage and errors are visible. The parent's log detail lists these calls under
+    "Vision bridge"; they are not counted as its attempts, and their tokens stay on their
+    own rows (no double counting on the dashboard).
+56. **Depth 1.** The bridge never runs inside a bridge call, even when the vision model has a
+    bridge of its own.
+57. **A failed bridge call fails the request**: the client gets "Vision bridge failed: ..."
+    with the sub-request's status (already client-safe), and the main model is not called.
+    An empty description counts as a failure. When no vision model is available (none
+    selected, or it was deleted) image requests answer 503.
+58. **The vision model is referenced by id** (`vision_bridge_model_id`), so renaming it keeps
+    the link and deleting it clears the reference. It must be another chat model; non-chat
+    models never keep a bridge. An empty prompt means the default prompt.
+59. **Descriptions are not cached.** Chat clients resend the whole conversation, so an image
+    is described again on every request that contains it; the calls run one after another
+    before the main request starts.

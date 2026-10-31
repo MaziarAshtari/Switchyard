@@ -711,3 +711,60 @@ func TestStreamFromAnthropicUpstreamToOpenAIClient(t *testing.T) {
 		t.Fatalf("anthropic request: %s", up.calls()[0].Body)
 	}
 }
+
+func TestAuthErrorDisablesKeyUntilRecoveryTime(t *testing.T) {
+	e := newEnv(t)
+	var credit atomic.Bool
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		if !credit.Load() {
+			w.WriteHeader(402)
+			io.WriteString(w, `{"error":{"message":"no credit left"}}`)
+			return
+		}
+		io.WriteString(w, chatOK)
+	})
+	set, _ := e.st.Settings(ctx)
+	set.DisabledKeyRecoveryMinutes = 10
+	if _, err := e.st.SaveSettings(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	inherit := e.provider("Inherit", "openai", up.URL)
+	custom := e.provider("Custom", "openai", up.URL)
+	five := 5
+	if _, err := e.st.UpdateProvider(ctx, custom.ID, store.ProviderInput{Name: "Custom", Type: "openai", BaseURL: up.URL,
+		Enabled: true, DisabledKeyRecoveryMinutes: &five}); err != nil {
+		t.Fatal(err)
+	}
+	k1 := e.key(inherit.ID, "sk-inherit-0000000000")
+	k2 := e.key(custom.ID, "sk-custom-00000000000")
+	e.model("best", "chat", nil, target(inherit.ID, "gpt-x"), target(custom.ID, "gpt-x"))
+
+	if resp, body := e.post("/v1/chat/completions", `{"model":"best","messages":[]}`); resp.StatusCode != 502 {
+		t.Fatalf("status %d %s", resp.StatusCode, body)
+	}
+	for id, want := range map[int64]time.Duration{k1.ID: 10 * time.Minute, k2.ID: 5 * time.Minute} {
+		k := e.keyState(id)
+		if k.Status != routing.StatusDisabled || k.DisabledUntil == nil {
+			t.Fatalf("key %d: %+v", id, k)
+		}
+		if d := time.Until(*k.DisabledUntil); d < want-time.Minute || d > want {
+			t.Fatalf("key %d recovers in %v, want ~%v", id, d, want)
+		}
+	}
+	if resp, body := e.post("/v1/chat/completions", `{"model":"best","messages":[]}`); resp.StatusCode != 503 {
+		t.Fatalf("disabled keys must be skipped: %d %s", resp.StatusCode, body)
+	}
+
+	// The recovery time of the first key passes.
+	past := time.Now().Add(-time.Second).UnixMilli()
+	if _, err := e.st.DB().Exec(`UPDATE api_keys SET disabled_until = ? WHERE id = ?`, past, k1.ID); err != nil {
+		t.Fatal(err)
+	}
+	credit.Store(true)
+	if resp, body := e.post("/v1/chat/completions", `{"model":"best","messages":[]}`); resp.StatusCode != 200 {
+		t.Fatalf("recovered key must be used again: %d %s", resp.StatusCode, body)
+	}
+	if k := e.keyState(k1.ID); k.Status != routing.StatusActive || k.SuccessCount != 1 {
+		t.Fatalf("recovered key: %+v", k)
+	}
+}

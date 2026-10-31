@@ -23,6 +23,8 @@ export interface Provider {
   proxy_id: number | null
   proxy_name: string
   key_strategy: KeyStrategy
+  /** Minutes until keys disabled by 401/402/403 are re-activated; null = Settings default, 0 = never. */
+  disabled_key_recovery_minutes: number | null
   created_at: string
   keys: KeyCounts
   model_count: number
@@ -37,6 +39,7 @@ export interface ProviderInput {
   enabled: boolean
   proxy_id: number | null
   key_strategy: KeyStrategy
+  disabled_key_recovery_minutes: number | null
 }
 
 export type ProxyMode = 'inherit' | 'direct' | 'specific'
@@ -55,6 +58,8 @@ export interface ApiKey {
   effective_proxy: { id: number; name: string; enabled: boolean } | null
   status: KeyStatus
   cooldown_until: string | null
+  /** Set while a disabled key waits for automatic re-activation. */
+  disabled_until: string | null
   last_error: string
   last_used_at: string | null
   success_count: number
@@ -155,6 +160,9 @@ export interface Model {
   max_keys_per_target: number
   retry_on: RetryOn[]
   attempt_timeout_seconds: number
+  vision_bridge_enabled: boolean
+  vision_bridge_model_id: number | null
+  vision_bridge_prompt: string
   created_at: string
   /** In priority order. */
   targets: Target[]
@@ -168,6 +176,10 @@ export interface ModelInput {
   max_keys_per_target: number
   retry_on: RetryOn[]
   attempt_timeout_seconds: number
+  vision_bridge_enabled: boolean
+  vision_bridge_model_id: number | null
+  /** Empty = default prompt. */
+  vision_bridge_prompt: string
   targets: { provider_id: number; upstream_model: string; weight: number; enabled: boolean }[]
 }
 
@@ -178,6 +190,8 @@ export interface Attempt {
   status_code: number
   latency_ms: number
   error: string
+  /** Set on vision bridge calls (not upstream attempts): the model that described an image. */
+  vision_bridge?: string
 }
 
 export interface ModelTestResult {
@@ -244,6 +258,8 @@ export interface Dashboard {
 export interface Settings {
   log_retention_days: number
   default_cooldown_seconds: number
+  /** 0 = never re-activate automatically. */
+  disabled_key_recovery_minutes: number
   log_bodies: boolean
   log_body_max_bytes: number
   proxy_test_url: string

@@ -68,13 +68,23 @@ func withModel(body []byte, contentType, model string) ([]byte, string, error) {
 	}
 	m, _ := json.Marshal(model)
 	fields["model"] = m
+	out, err := encodeJSON(fields)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, "application/json", nil
+}
+
+// encodeJSON is json.Marshal without HTML escaping, so strings are not
+// rewritten when a client body is re-encoded.
+func encodeJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(fields); err != nil {
-		return nil, "", err
+	if err := enc.Encode(v); err != nil {
+		return nil, err
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), "application/json", nil
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 func multipartWithModel(body []byte, contentType, model string) ([]byte, string, error) {

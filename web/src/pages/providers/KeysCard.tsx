@@ -37,8 +37,12 @@ export function KeysCard({ provider }: { provider: Provider }) {
     { success: (r, body) => `${batchDone[body.action]} ${plural(r.updated, 'key')}` },
   )
   const remove = useAction((k: ApiKey) => api.del(`/api/keys/${k.id}`), { success: 'Key deleted' })
+  const resetAll = useAction(() => api.post<{ updated: number }>(`/api/providers/${provider.id}/keys/reset`), {
+    success: (r) => (r.updated ? `Re-activated ${plural(r.updated, 'key')}` : 'No keys needed re-activation'),
+  })
 
   const list = keys.data ?? []
+  const inactive = list.filter((k) => k.status !== 'active').length
   // Ignore selected ids of keys that no longer exist.
   const selectedIds = list.filter((k) => selected.has(k.id)).map((k) => k.id)
   const allChecked =
@@ -98,7 +102,21 @@ export function KeysCard({ provider }: { provider: Provider }) {
             Rate-limited keys cool down and rejected keys are disabled automatically; requests then use the next key.
           </p>
         </div>
-        {list.length > 0 && <div className="flex gap-2">{addButtons}</div>}
+        {list.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={inactive === 0 || resetAll.isPending}
+              onClick={() => resetAll.mutate()}
+              title="Re-activate all disabled keys and clear cooldowns now"
+            >
+              <RotateCcw />
+              Reset disabled keys
+            </Button>
+            {addButtons}
+          </div>
+        )}
       </div>
 
       {selectedIds.length > 0 && (

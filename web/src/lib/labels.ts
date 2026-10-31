@@ -59,6 +59,15 @@ export const retryOnOptions: { value: RetryOn; label: string }[] = [
   { value: 'connection', label: 'Connection error' },
 ]
 
+/** Upper bound of the disabled-key recovery period (one year), as on the server. */
+export const maxKeyRecoveryMinutes = 525600
+
+/** "Never", "After 30 min", "After 2 h". */
+export function keyRecoveryText(minutes: number): string {
+  if (minutes <= 0) return 'Never'
+  return `After ${minutes % 60 === 0 ? `${minutes / 60} h` : `${minutes} min`}`
+}
+
 export function labelOf<T extends string>(list: { value: T; label: string }[], value: T): string {
   return list.find((item) => item.value === value)?.label ?? value
 }

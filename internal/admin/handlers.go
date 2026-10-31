@@ -183,6 +183,20 @@ func (a *API) resetKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, k)
 }
 
+// resetProviderKeys re-activates all disabled and cooling-down keys of a provider.
+func (a *API) resetProviderKeys(w http.ResponseWriter, r *http.Request) {
+	id, ok := idParam(w, r)
+	if !ok {
+		return
+	}
+	n, err := a.store.ResetProviderKeys(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"updated": n})
+}
+
 func (a *API) testKey(w http.ResponseWriter, r *http.Request) {
 	id, ok := idParam(w, r)
 	if !ok {

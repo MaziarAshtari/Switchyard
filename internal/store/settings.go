@@ -14,12 +14,18 @@ import (
 
 // Settings are the user-editable runtime settings.
 type Settings struct {
-	LogRetentionDays       int    `json:"log_retention_days"`
-	DefaultCooldownSeconds int    `json:"default_cooldown_seconds"`
-	LogBodies              bool   `json:"log_bodies"`
-	LogBodyMaxBytes        int    `json:"log_body_max_bytes"`
-	ProxyTestURL           string `json:"proxy_test_url"`
+	LogRetentionDays       int `json:"log_retention_days"`
+	DefaultCooldownSeconds int `json:"default_cooldown_seconds"`
+	// DisabledKeyRecoveryMinutes re-activates keys disabled by 401/402/403
+	// after this long (0 = never); providers may override it.
+	DisabledKeyRecoveryMinutes int    `json:"disabled_key_recovery_minutes"`
+	LogBodies                  bool   `json:"log_bodies"`
+	LogBodyMaxBytes            int    `json:"log_body_max_bytes"`
+	ProxyTestURL               string `json:"proxy_test_url"`
 }
+
+// MaxKeyRecoveryMinutes bounds the disabled-key recovery period (one year).
+const MaxKeyRecoveryMinutes = 525600
 
 // DefaultSettings are used for settings that were never saved.
 func DefaultSettings() Settings {
@@ -62,6 +68,8 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 			set.LogRetentionDays = n
 		case "default_cooldown_seconds":
 			set.DefaultCooldownSeconds = n
+		case "disabled_key_recovery_minutes":
+			set.DisabledKeyRecoveryMinutes = n
 		case "log_bodies":
 			set.LogBodies = v == "true"
 		case "log_body_max_bytes":
@@ -87,6 +95,9 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (Settings, error)
 	if in.DefaultCooldownSeconds < 1 || in.DefaultCooldownSeconds > 86400 {
 		errs["default_cooldown_seconds"] = "Must be between 1 and 86400 seconds"
 	}
+	if msg := checkKeyRecovery(in.DisabledKeyRecoveryMinutes); msg != "" {
+		errs["disabled_key_recovery_minutes"] = msg
+	}
 	if in.LogBodyMaxBytes < 1024 || in.LogBodyMaxBytes > 10<<20 {
 		errs["log_body_max_bytes"] = "Must be between 1 KB and 10 MB"
 	}
@@ -97,11 +108,12 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (Settings, error)
 		return Settings{}, errs
 	}
 	values := map[string]string{
-		"log_retention_days":       strconv.Itoa(in.LogRetentionDays),
-		"default_cooldown_seconds": strconv.Itoa(in.DefaultCooldownSeconds),
-		"log_bodies":               strconv.FormatBool(in.LogBodies),
-		"log_body_max_bytes":       strconv.Itoa(in.LogBodyMaxBytes),
-		"proxy_test_url":           in.ProxyTestURL,
+		"log_retention_days":            strconv.Itoa(in.LogRetentionDays),
+		"default_cooldown_seconds":      strconv.Itoa(in.DefaultCooldownSeconds),
+		"disabled_key_recovery_minutes": strconv.Itoa(in.DisabledKeyRecoveryMinutes),
+		"log_bodies":                    strconv.FormatBool(in.LogBodies),
+		"log_body_max_bytes":            strconv.Itoa(in.LogBodyMaxBytes),
+		"proxy_test_url":                in.ProxyTestURL,
 	}
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		for k, v := range values {
@@ -118,6 +130,13 @@ func (s *Store) SaveSettings(ctx context.Context, in Settings) (Settings, error)
 	s.settings = &in
 	s.settingsMu.Unlock()
 	return in, nil
+}
+
+func checkKeyRecovery(minutes int) string {
+	if minutes < 0 || minutes > MaxKeyRecoveryMinutes {
+		return "Must be between 0 (never) and 525600 minutes (one year)"
+	}
+	return ""
 }
 
 func setSetting(ctx context.Context, db execer, key, value string) error {

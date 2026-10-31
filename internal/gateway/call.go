@@ -116,11 +116,17 @@ func (c *call) run() {
 		return
 	}
 	c.x = &Exchange{Endpoint: c.ep.path, Format: c.ep.format, Model: m, Header: c.r.Header, ContentType: contentType, Body: body}
-	for _, p := range c.g.Pre {
-		if err := p.PreProcess(c.ctx, c.x); err != nil {
+	if err := c.preProcess(); err != nil {
+		var pe *ProcessError
+		switch {
+		case c.ctx.Err() != nil:
+			c.entry.StatusCode, c.entry.Error = 499, "client closed the request"
+		case errors.As(err, &pe):
+			c.fail(pe.Status, pe.Message)
+		default:
 			c.fail(http.StatusBadRequest, err.Error())
-			return
 		}
+		return
 	}
 	if c.ep.modelType == "chat" {
 		req, err := c.g.inbound[c.ep.format].DecodeRequest(c.x.Body)
@@ -132,6 +138,19 @@ func (c *call) run() {
 		c.entry.Stream = req.Stream
 	}
 	c.route()
+}
+
+// preProcess runs the pre-processors and records their sub-requests, also
+// when one of them fails.
+func (c *call) preProcess() error {
+	var err error
+	for _, p := range c.g.Pre {
+		if err = p.PreProcess(c.ctx, c.x); err != nil {
+			break
+		}
+	}
+	c.entry.AttemptDetails = append(c.entry.AttemptDetails, c.x.SubRequests...)
+	return err
 }
 
 // route runs the retry plan until an attempt delivers a response or the plan
@@ -155,7 +174,7 @@ func (c *call) route() {
 		}
 		byID[t.ID] = t
 		targets = append(targets, routing.Target{ID: t.ID, ProviderID: t.ProviderID, KeyStrategy: p.KeyStrategy,
-			Weight: t.Weight, Enabled: t.Enabled && p.Enabled})
+			KeyRecovery: p.KeyRecovery(c.settings), Weight: t.Weight, Enabled: t.Enabled && p.Enabled})
 	}
 	plan := c.g.router.NewPlan(m.ID, policy, targets, c.keySource)
 	var last *result
@@ -219,7 +238,7 @@ func (c *call) recordAttempt(a routing.Attempt, t store.Target, res result) {
 		ProviderName: p.Name, KeyHint: k.SecretHint, UpstreamModel: t.UpstreamModel,
 		StatusCode: res.status, LatencyMS: res.latency.Milliseconds(), Error: res.errMsg,
 	})
-	c.entry.Attempts = len(c.entry.AttemptDetails)
+	c.entry.Attempts++ // attempt details may also hold pre-processor sub-requests
 	providerID, keyID := p.ID, k.ID
 	c.entry.ProviderID, c.entry.ProviderName = &providerID, p.Name
 	c.entry.KeyID, c.entry.KeyHint = &keyID, k.SecretHint
